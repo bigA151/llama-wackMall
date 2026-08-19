@@ -684,8 +684,14 @@ static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const ch
     if (strcmp(name, "ggml_set_moe_predict_hook") == 0) {
         return (void *)ggml_set_moe_predict_hook;
     }
+    if (strcmp(name, "ggml_set_moe_predict_match_hook") == 0) {
+        return (void *)ggml_set_moe_predict_match_hook;
+    }
     if (strcmp(name, "ggml_set_moe_probe_hook") == 0) {
         return (void *)ggml_set_moe_probe_hook;
+    }
+    if (strcmp(name, "ggml_set_moe_prefetch_use_hook") == 0) {
+        return (void *)ggml_set_moe_prefetch_use_hook;
     }
     if (strcmp(name, "ggml_set_moe_fetch_hook") == 0) {
         return (void *)ggml_set_moe_fetch_hook;

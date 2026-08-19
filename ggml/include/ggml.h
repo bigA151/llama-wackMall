@@ -1497,9 +1497,17 @@ extern "C" {
     // key) and the router input x. Runs on the CPU compute thread.
     GGML_API void ggml_set_moe_predict_hook(void (*fn)(const struct ggml_tensor * counts, const struct ggml_tensor * x));
 
+    // expert tiering: optional prediction-match hook. Called with each
+    // layer's actual routed expert IDs after the pre-gate prediction hook.
+    GGML_API void ggml_set_moe_predict_match_hook(void (*fn)(const struct ggml_tensor * counts, const struct ggml_tensor * ids));
+
     // expert tiering: optional residency probe for in-flight prefetch fills;
     // returns the READY pool slot address for the expert, else `fallback`
     GGML_API void ggml_set_moe_probe_hook(const char * (*fn)(const void * key, int64_t expert, const char * fallback));
+
+    // expert tiering: optional decode-use hook for speculative prefetches.
+    // Called once per cold MoE op with one entry per expert in `row_counts`.
+    GGML_API void ggml_set_moe_prefetch_use_hook(void (*fn)(const void * key, const int64_t * row_counts, int64_t n_expert, bool is_decode));
 
     // expert tiering: optional demand-fetch hook (pread staging ring);
     // returns a staged copy of the expert's weight slice, else `fallback`

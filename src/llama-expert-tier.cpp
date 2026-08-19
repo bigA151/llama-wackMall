@@ -45,15 +45,19 @@ typedef SSIZE_T ssize_t; // POSIX type not provided on Windows
 // (same pattern as llama-context.cpp for ggml_backend_cpu_set_threadpool).
 typedef void (*moe_predict_hook_fn)(const ggml_tensor *, const ggml_tensor *);
 typedef const char * (*moe_addr_hook_fn)(const void *, int64_t, const char *);
+typedef void (*moe_prefetch_use_hook_fn)(const void *, const int64_t *, int64_t, bool);
 
 typedef void (*moe_set_predict_fn)(moe_predict_hook_fn);
 typedef void (*moe_set_addr_fn)(moe_addr_hook_fn);
+typedef void (*moe_set_prefetch_use_fn)(moe_prefetch_use_hook_fn);
 typedef void (*moe_set_route_fn)(FILE *, int);
 typedef uint64_t (*moe_timer_fn)(void);
 
 static moe_set_predict_fn g_fn_predict = NULL;
+static moe_set_predict_fn g_fn_predict_match = NULL;
 static moe_set_addr_fn    g_fn_probe   = NULL;
 static moe_set_addr_fn    g_fn_fetch   = NULL;
+static moe_set_prefetch_use_fn g_fn_prefetch_use = NULL;
 static moe_set_route_fn   g_fn_route   = NULL;
 static moe_timer_fn       g_fn_timer   = NULL;
 
@@ -71,15 +75,19 @@ static void tier_resolve_moe_hooks(void) {
         return;
     }
     g_fn_predict = (moe_set_predict_fn) ggml_backend_reg_get_proc_address(reg, "ggml_set_moe_predict_hook");
+    g_fn_predict_match = (moe_set_predict_fn) ggml_backend_reg_get_proc_address(reg, "ggml_set_moe_predict_match_hook");
     g_fn_probe   = (moe_set_addr_fn)    ggml_backend_reg_get_proc_address(reg, "ggml_set_moe_probe_hook");
     g_fn_fetch   = (moe_set_addr_fn)    ggml_backend_reg_get_proc_address(reg, "ggml_set_moe_fetch_hook");
+    g_fn_prefetch_use = (moe_set_prefetch_use_fn) ggml_backend_reg_get_proc_address(reg, "ggml_set_moe_prefetch_use_hook");
     g_fn_route   = (moe_set_route_fn)   ggml_backend_reg_get_proc_address(reg, "ggml_set_route_trace");
     g_fn_timer   = (moe_timer_fn)       ggml_backend_reg_get_proc_address(reg, "ggml_moe_cold_timer_us");
 }
 
 #define MOE_PREDICT_HOOK(fn)   do { if (g_fn_predict) g_fn_predict((fn)); } while (0)
+#define MOE_PREDICT_MATCH_HOOK(fn) do { if (g_fn_predict_match) g_fn_predict_match((fn)); } while (0)
 #define MOE_PROBE_HOOK(fn)     do { if (g_fn_probe)   g_fn_probe((fn));   } while (0)
 #define MOE_FETCH_HOOK(fn)     do { if (g_fn_fetch)   g_fn_fetch((fn));   } while (0)
+#define MOE_PREFETCH_USE_HOOK(fn) do { if (g_fn_prefetch_use) g_fn_prefetch_use((fn)); } while (0)
 #define MOE_ROUTE_HOOK(f, n)   do { if (g_fn_route)   g_fn_route((f), (n)); } while (0)
 #define MOE_TIMER_HOOK()       (g_fn_timer ? g_fn_timer() : 0)
 
@@ -278,6 +286,8 @@ struct layer_tier {
     std::unique_ptr<std::atomic<int32_t>[]> stateB; // [n_slotsB] 0 free/1 filling/2 ready/3 resident
     std::unique_ptr<std::atomic<int32_t>[]> lutB;   // [n_expert], -1 = not in B
     std::unique_ptr<std::atomic<int64_t>[]> lastB;  // [n_slotsB] last-predicted step
+    std::unique_ptr<std::atomic<uint64_t>[]> fillB; // [n_slotsB] successful-fill generation
+    std::unique_ptr<std::atomic<uint64_t>[]> checkedB; // [n_slotsB] generation checked at first decode
 };
 
 static int  g_S        = 16;
@@ -321,6 +331,8 @@ static std::unordered_map<const void *, int> g_pred_ix; // counts->data -> g_pre
 static bool g_predict = false; // LLAMA_EXPERT_PREDICT=1 enables
 static FILE * g_pred_log = nullptr; // LLAMA_EXPERT_PREDICT_LOG (debug)
 static uint64_t g_pred_pushes = 0;
+static std::vector<std::deque<std::vector<int32_t>>> g_pred_pending; // [layer], one top-K set per token
+static uint64_t g_predicted_experts = 0, g_predicted_experts_used = 0;
 
 // prefetch probe: lets a cold op read an expert straight from a READY
 // (fully memcpy'd, not yet published) pool slot instead of the mmap source.
@@ -336,6 +348,67 @@ struct probe_ctx {
 };
 static std::unordered_map<const void *, probe_ctx> g_probe_ix; // ptrs->data -> ctx
 static std::atomic<uint64_t> g_probe_hits{0}, g_probe_miss{0};
+static std::atomic<uint64_t> g_pred_fill_generation{0};
+static std::atomic<uint64_t> g_pred_first_decode_used{0};
+
+static void pregate_prefetch_use(const void * key, const int64_t * row_counts, int64_t n_expert, bool is_decode) {
+    if (!is_decode || !row_counts) {
+        return;
+    }
+    auto it = g_probe_ix.find(key);
+    if (it == g_probe_ix.end()) {
+        return;
+    }
+    const probe_ctx & c = it->second;
+    for (const auto & L : g_layers) {
+        if (L.lutB.get() != c.lut || L.n_expert != n_expert) {
+            continue;
+        }
+        for (int k = 0; k < L.n_slotsB; k++) {
+            if (L.stateB[k].load(std::memory_order_acquire) < 2) {
+                continue;
+            }
+            const uint64_t generation = L.fillB[k].load(std::memory_order_acquire);
+            if (generation == 0 || L.checkedB[k].exchange(generation, std::memory_order_acq_rel) == generation) {
+                continue;
+            }
+            const int32_t e = L.ownersB[k];
+            if (e >= 0 && e < n_expert && row_counts[e] > 0) {
+                g_pred_first_decode_used.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        return;
+    }
+}
+
+static void pregate_predict_match(const ggml_tensor * counts, const ggml_tensor * ids) {
+    if (!counts || !counts->data || !ids || !ids->data) {
+        return;
+    }
+    auto it = g_pred_ix.find(counts->data);
+    if (it == g_pred_ix.end()) {
+        return;
+    }
+    const int il = g_pred[it->second].il;
+    if (il < 0 || il >= (int) g_pred_pending.size()) {
+        return;
+    }
+    auto & pending = g_pred_pending[il];
+    for (int64_t t = 0; t < ids->ne[1] && !pending.empty(); t++) {
+        const std::vector<int32_t> predicted = std::move(pending.front());
+        pending.pop_front();
+        g_predicted_experts += predicted.size();
+        for (const int32_t e : predicted) {
+            for (int64_t id = 0; id < ids->ne[0]; id++) {
+                const int32_t actual = *(const int32_t *) ((const char *) ids->data + t*ids->nb[1] + id*ids->nb[0]);
+                if (e == actual) {
+                    g_predicted_experts_used++;
+                    break;
+                }
+            }
+        }
+    }
+}
 
 static bool g_dirty = false;
 static std::string g_sidecar_path;
@@ -594,7 +667,8 @@ static size_t g_poolB_alloc = 0;
 static int g_n_workers = 2;        // LLAMA_EXPERT_PREFETCH_THREADS (clamp 1..8)
 static std::atomic<uint64_t> g_pred_step{0}; // window tick for lastB timestamps
 static uint64_t g_predB_evict = 0; // timestamp evictions by the window
-static uint64_t g_pred_fills = 0, g_pred_published = 0;
+static std::atomic<uint64_t> g_pred_fills{0};
+static uint64_t g_pred_published = 0;
 static uint64_t g_pred_drop_hot = 0, g_pred_drop_dup = 0, g_pred_drop_budget = 0, g_pred_drop_full = 0;
 
 static void prefetch_fill(int pi, int e) {
@@ -650,6 +724,7 @@ static void prefetch_fill(int pi, int e) {
         const size_t slice = ggml_nbytes(kv.first)/L.n_expert;
         memcpy(L.poolB + (size_t) k*L.pool_slot_bytes + st.pool_off, (const char *) kv.first->data + slice*e, slice);
     }
+    L.fillB[k].store(g_pred_fill_generation.fetch_add(1, std::memory_order_relaxed) + 1, std::memory_order_release);
     L.stateB[k].store(2, std::memory_order_release);
     g_work_inflight.fetch_sub((int64_t) L.pool_slot_bytes, std::memory_order_relaxed);
     g_pred_fills++;
@@ -723,6 +798,10 @@ static void pregate_hook(const ggml_tensor * counts, const ggml_tensor * x) {
         }
         std::partial_sort(idx.begin(), idx.begin() + K, idx.end(),
                 [&](int32_t a, int32_t b) { return lg[a] > lg[b]; });
+        if (!g_pred_pending.empty()) {
+            std::vector<int32_t> predicted(idx.begin(), idx.begin() + K);
+            g_pred_pending[nxt.il].emplace_back(std::move(predicted));
+        }
         if (g_pred_log) {
             fprintf(g_pred_log, "%llu,%lld,%d", (unsigned long long) cur_seq, (long long) x->ne[1], nxt.il);
             for (int k = 0; k < K; k++) {
@@ -787,9 +866,14 @@ static void pred_init(const llama_model & model) {
         mirror_bytes += (size_t) (n_exp + 1)*ne0*sizeof(float);
     }
     const bool want_worker = g_predict && g_poolB_bytes > 0 && g_pred.size() >= 2;
-    if (g_pred.size() >= 2 && (g_pred_log || want_worker)) {
+    const bool want_predict_accuracy = g_predict && getenv("LLAMA_EXPERT_STATS") != nullptr;
+    if (g_pred.size() >= 2 && (g_pred_log || want_worker || want_predict_accuracy)) {
         tier_resolve_moe_hooks();
         MOE_PREDICT_HOOK(pregate_hook);
+        if (want_predict_accuracy) {
+            g_pred_pending.resize(model.hparams.n_layer());
+            MOE_PREDICT_MATCH_HOOK(pregate_predict_match);
+        }
     }
     if (want_worker) {
         for (auto & kv : g_stores) {
@@ -807,6 +891,7 @@ static void pred_init(const llama_model & model) {
         }
         tier_resolve_moe_hooks();
         MOE_PROBE_HOOK(pregate_probe);
+        MOE_PREFETCH_USE_HOOK(pregate_prefetch_use);
         for (int i = 0; i < g_n_workers; i++) {
             g_workers.emplace_back(prefetch_worker);
         }
@@ -1140,12 +1225,22 @@ static void dump_stats() {
                         (double) g_pool_alloc/(double) (1 << 30));
             }
             if (g_pred.size() >= 2) {
+                const uint64_t prefetch_fills = g_pred_fills.load(std::memory_order_relaxed);
+                const uint64_t prefetch_first_decode_used = g_pred_first_decode_used.load(std::memory_order_relaxed);
                 fprintf(f, "expert_predict: pushes %llu fills %llu published %llu specevict %llu probe %llu/%llu drop hot %llu dup %llu budget %llu full %llu\n",
-                        (unsigned long long) g_pred_pushes, (unsigned long long) g_pred_fills,
+                        (unsigned long long) g_pred_pushes, (unsigned long long) prefetch_fills,
                         (unsigned long long) g_pred_published, (unsigned long long) g_predB_evict,
                         (unsigned long long) g_probe_hits.load(), (unsigned long long) g_probe_miss.load(),
                         (unsigned long long) g_pred_drop_hot, (unsigned long long) g_pred_drop_dup,
                         (unsigned long long) g_pred_drop_budget, (unsigned long long) g_pred_drop_full);
+                fprintf(f, "expert_prefetch_effectiveness: first_decode_used %llu / completed %llu (%.1f%%)\n",
+                        (unsigned long long) prefetch_first_decode_used,
+                        (unsigned long long) prefetch_fills,
+                        prefetch_fills ? 100.0*(double) prefetch_first_decode_used/(double) prefetch_fills : 0.0);
+                fprintf(f, "expert_predict_accuracy: routed_used %llu / predicted %llu (%.1f%%)\n",
+                        (unsigned long long) g_predicted_experts_used,
+                        (unsigned long long) g_predicted_experts,
+                        g_predicted_experts ? 100.0*(double) g_predicted_experts_used/(double) g_predicted_experts : 0.0);
             }
             if (g_stage_n > 0) {
                 fprintf(f, "expert_pread: fetches %llu bytes %llu stalls %llu fallbacks %llu fails %llu\n",
@@ -1881,8 +1976,12 @@ if (!dev) {
                 L.lutB[e].store(-1, std::memory_order_relaxed);
             }
             L.lastB.reset(new std::atomic<int64_t>[L.n_slotsB]);
+            L.fillB.reset(new std::atomic<uint64_t>[L.n_slotsB]);
+            L.checkedB.reset(new std::atomic<uint64_t>[L.n_slotsB]);
             for (int k = 0; k < L.n_slotsB; k++) {
                 L.lastB[k].store(0, std::memory_order_relaxed);
+                L.fillB[k].store(0, std::memory_order_relaxed);
+                L.checkedB[k].store(0, std::memory_order_relaxed);
             }
         }
         TIER_LOG("%s: spec pool: %.2f GiB over %d layers (%d threads)\n",

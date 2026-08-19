@@ -1767,6 +1767,14 @@ void ggml_set_moe_probe_hook(const char * (*fn)(const void *, int64_t, const cha
     g_moe_probe_hook = fn;
 }
 
+// expert tiering: optional per-expert decode-use hook for speculative
+// prefetch effectiveness statistics
+static void (*g_moe_prefetch_use_hook)(const void *, const int64_t *, int64_t, bool) = NULL;
+
+void ggml_set_moe_prefetch_use_hook(void (*fn)(const void *, const int64_t *, int64_t, bool)) {
+    g_moe_prefetch_use_hook = fn;
+}
+
 // expert tiering: optional demand-fetch hook (pread staging ring), set by
 // the tier module; keyed by the ptrs tensor's data pointer
 static const char * (*g_moe_fetch_hook)(const void *, int64_t, const char *) = NULL;
@@ -2128,6 +2136,14 @@ void ggml_set_moe_predict_hook(void (*fn)(const struct ggml_tensor *, const stru
     g_moe_predict_hook = fn;
 }
 
+// expert tiering: optional actual-route hook for matching pre-gate
+// predictions against the next layer's selected experts
+static void (*g_moe_predict_match_hook)(const struct ggml_tensor *, const struct ggml_tensor *) = NULL;
+
+void ggml_set_moe_predict_match_hook(void (*fn)(const struct ggml_tensor *, const struct ggml_tensor *)) {
+    g_moe_predict_match_hook = fn;
+}
+
 static void ggml_compute_forward_moe_cold(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst) {
@@ -2214,6 +2230,9 @@ static void ggml_compute_forward_moe_cold(
         if (g_moe_predict_hook) {
             g_moe_predict_hook(counts, x);
         }
+        if (g_moe_predict_match_hook) {
+            g_moe_predict_match_hook(counts, ids);
+        }
 
         int32_t * cnt = counts ? (int32_t *) counts->data : NULL;
         for (int64_t t = 0; t < n_tokens; t++) {
@@ -2236,6 +2255,9 @@ static void ggml_compute_forward_moe_cold(
         for (int e = 0; e < n_as; e++) {
             col0[e] = coff;
             coff += matrix_row_counts[e];
+        }
+        if (g_moe_prefetch_use_hook && dst->src[7]) {
+            g_moe_prefetch_use_hook(dst->src[7]->data, matrix_row_counts, n_as, n_tokens == 1);
         }
     }
 
