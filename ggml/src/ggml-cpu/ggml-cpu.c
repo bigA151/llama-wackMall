@@ -2124,9 +2124,28 @@ static void trace_moe_route(const struct ggml_tensor * ids) {
 
 // expert tiering: wall-clock accumulator for MOE_COLD ops (ith==0 only)
 static uint64_t g_moe_cold_us = 0;
+static uint64_t g_moe_cold_setup_us = 0;
+static uint64_t g_moe_cold_gate_up_us = 0;
+static uint64_t g_moe_cold_activation_us = 0;
 
 uint64_t ggml_moe_cold_timer_us(void) {
     return g_moe_cold_us;
+}
+
+void ggml_moe_cold_timers_us(uint64_t * total, uint64_t * setup,
+                              uint64_t * gate_up, uint64_t * activation) {
+    if (total) {
+        *total = g_moe_cold_us;
+    }
+    if (setup) {
+        *setup = g_moe_cold_setup_us;
+    }
+    if (gate_up) {
+        *gate_up = g_moe_cold_gate_up_us;
+    }
+    if (activation) {
+        *activation = g_moe_cold_activation_us;
+    }
 }
 
 // expert tiering: optional pre-gate prediction hook, set by the tier module
@@ -2147,6 +2166,10 @@ void ggml_set_moe_predict_match_hook(void (*fn)(const struct ggml_tensor *, cons
 static void ggml_compute_forward_moe_cold(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst) {
+
+    // Thread 0 measures wall time; phase barriers make these timings reflect
+    // the full CPU team rather than summed per-thread CPU time.
+    const int64_t t_setup_0 = params->ith == 0 ? ggml_time_us() : 0;
 
     const struct ggml_tensor * w_gate = dst->src[0];
     const struct ggml_tensor * w_up   = dst->src[1];
@@ -2269,6 +2292,13 @@ static void ggml_compute_forward_moe_cold(
 
     ggml_barrier(params->threadpool);
 
+    int64_t t_gate_up_0 = 0;
+    if (ith == 0) {
+        const int64_t now = ggml_time_us();
+        g_moe_cold_setup_us += (uint64_t) (now - t_setup_0);
+        t_gate_up_0 = now;
+    }
+
     // phase A: gate/up dots for all cold slots into gate_out/up_out
     for (int cur_a = 0; cur_a < n_as; ++cur_a) {
         const int64_t cne1 = matrix_row_counts[cur_a];
@@ -2329,6 +2359,13 @@ static void ggml_compute_forward_moe_cold(
 
     ggml_barrier(params->threadpool);
 
+    int64_t t_activation_0 = 0;
+    if (ith == 0) {
+        const int64_t now = ggml_time_us();
+        g_moe_cold_gate_up_us += (uint64_t) (now - t_gate_up_0);
+        t_activation_0 = now;
+    }
+
     // phase B (multi-threaded): activation (SwiGLU/GELU) + quantize the intermediate
     const int64_t total_cols = n_as > 0 ? (col0[n_as - 1] + matrix_row_counts[n_as - 1]) : 0;
     const bool is_gelu = (w_gate == w_up);
@@ -2361,6 +2398,10 @@ static void ggml_compute_forward_moe_cold(
     }
 
     ggml_barrier(params->threadpool);
+
+    if (ith == 0) {
+        g_moe_cold_activation_us += (uint64_t) (ggml_time_us() - t_activation_0);
+    }
 
     // phase C: down dots for all cold slots, scattered into dst
     for (int cur_a = 0; cur_a < n_as; ++cur_a) {

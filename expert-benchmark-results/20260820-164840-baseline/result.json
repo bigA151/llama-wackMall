@@ -1,0 +1,88 @@
+﻿{
+    "experiment":  "baseline",
+    "run_directory":  "D:\\llama-wackMall\\llama-wackMall-main\\expert-benchmark-results\\20260820-164840-baseline",
+    "started_utc":  "2026-08-20T08:48:40.3309648Z",
+    "finished_utc":  "2026-08-20T08:51:04.0866485Z",
+    "duration_seconds":  143.756,
+    "exit_code":  null,
+    "command":  [
+                    "D:\\llama-wackMall\\llama-wackMall-main\\build-msvc-vulkan-x64\\bin\\llama-cli.exe",
+                    "-m",
+                    "D:\\model\\Qwen3.5-122B-A10B-UD-IQ2_M.gguf",
+                    "-c",
+                    "2048",
+                    "-fit",
+                    "off",
+                    "-ngl",
+                    "0",
+                    "-p",
+                    "讲讲孙悟空大闹天宫的故事",
+                    "--temp",
+                    "0",
+                    "--reasoning-budget",
+                    "0",
+                    "-n",
+                    "200"
+                ],
+    "environment":  {
+                        "LLAMA_EXPERT_PREFETCH_GB":  "0",
+                        "LLAMA_EXPERT_ADAPT":  "0",
+                        "LLAMA_EXPERT_STATS":  "D:\\llama-wackMall\\llama-wackMall-main\\expert-benchmark-results\\20260820-164840-baseline\\expert-stats.log",
+                        "LLAMA_EXPERT_PREDICT":  "0",
+                        "LLAMA_EXPERT_S":  "180",
+                        "LLAMA_EXPERT_MADVISE":  "1",
+                        "LLAMA_EXPERT_RAMPOOL":  "0",
+                        "LLAMA_EXPERT_PREAD":  "0",
+                        "LLAMA_EXPERT_PREFETCH_MB":  "32",
+                        "LLAMA_EXPERT_PREFETCH_THREADS":  "0"
+                    },
+    "prompt_tokens_per_second":  null,
+    "generation_tokens_per_second":  null,
+    "resource_summary":  {
+                             "sample_count":  66,
+                             "system_ram_used_mib":  {
+                                                         "max":  50237.4,
+                                                         "average":  39714.5
+                                                     },
+                             "llama_process_working_set_mib":  {
+                                                                   "max":  35468.1,
+                                                                   "average":  26592.4
+                                                               },
+                             "gpu_memory_used_mib_by_adapter":  [
+                                                                    {
+                                                                        "adapter":  "luid_0x00000000_0x0000ebe7_phys_0",
+                                                                        "shared_max":  0,
+                                                                        "shared_average":  0,
+                                                                        "dedicated_max":  0,
+                                                                        "dedicated_average":  0,
+                                                                        "local_max":  0,
+                                                                        "local_average":  0
+                                                                    },
+                                                                    {
+                                                                        "adapter":  "luid_0x00000000_0x0000ec45_phys_0",
+                                                                        "shared_max":  39.9,
+                                                                        "shared_average":  39.9,
+                                                                        "dedicated_max":  0,
+                                                                        "dedicated_average":  0,
+                                                                        "local_max":  39.9,
+                                                                        "local_average":  39.9
+                                                                    },
+                                                                    {
+                                                                        "adapter":  "luid_0x00000000_0x0000e566_phys_0",
+                                                                        "shared_max":  1578.3,
+                                                                        "shared_average":  1544.1,
+                                                                        "dedicated_max":  0,
+                                                                        "dedicated_average":  0,
+                                                                        "local_max":  1575.8,
+                                                                        "local_average":  1542.5
+                                                                    }
+                                                                ]
+                         },
+    "files":  {
+                  "resource_samples":  "D:\\llama-wackMall\\llama-wackMall-main\\expert-benchmark-results\\20260820-164840-baseline\\resources.jsonl",
+                  "stdout":  "D:\\llama-wackMall\\llama-wackMall-main\\expert-benchmark-results\\20260820-164840-baseline\\llama.stdout.log",
+                  "stderr":  "D:\\llama-wackMall\\llama-wackMall-main\\expert-benchmark-results\\20260820-164840-baseline\\llama.stderr.log",
+                  "expert_stats":  "D:\\llama-wackMall\\llama-wackMall-main\\expert-benchmark-results\\20260820-164840-baseline\\expert-stats.log",
+                  "expert_predict":  null
+              }
+}

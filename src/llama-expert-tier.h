@@ -14,6 +14,7 @@ struct llama_model;
 //   LLAMA_EXPERT_S     - hot slots per layer (default 16)
 //   LLAMA_EXPERT_TMAX  - max n_tokens for the hot/cold path (default 16)
 //   LLAMA_EXPERT_STATS - dump cold-hit stats at exit ("1" = stderr, else path)
+//   LLAMA_EXPERT_TIMING - emit cumulative timing every N updates ("1" = every update)
 //   LLAMA_EXPERT_ADAPT - 1: online repin of hot slots (decay + hysteresis)
 //   LLAMA_EXPERT_USAGE - dump learned hot set at exit (heat csv format)
 

@@ -1522,6 +1522,15 @@ extern "C" {
     // (measured at op dispatch + barrier, ith==0 only)
     GGML_API uint64_t ggml_moe_cold_timer_us(void);
 
+    // expert tiering: cumulative MOE_COLD wall-clock timings. setup covers
+    // input quantization, routing bookkeeping and prediction hooks; gate_up
+    // covers phase A; activation covers phase B. The remainder of total is
+    // phase C (down projection) plus graph-thread synchronization.
+    GGML_API void ggml_moe_cold_timers_us(uint64_t * total,
+                                          uint64_t * setup,
+                                          uint64_t * gate_up,
+                                          uint64_t * activation);
+
     // A: m columns, n rows,
     // B: p columns, n rows,
     // result is m columns, p rows

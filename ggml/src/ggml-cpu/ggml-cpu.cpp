@@ -702,6 +702,9 @@ static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const ch
     if (strcmp(name, "ggml_moe_cold_timer_us") == 0) {
         return (void *)ggml_moe_cold_timer_us;
     }
+    if (strcmp(name, "ggml_moe_cold_timers_us") == 0) {
+        return (void *)ggml_moe_cold_timers_us;
+    }
 
     return NULL;
 

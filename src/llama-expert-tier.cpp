@@ -52,6 +52,7 @@ typedef void (*moe_set_addr_fn)(moe_addr_hook_fn);
 typedef void (*moe_set_prefetch_use_fn)(moe_prefetch_use_hook_fn);
 typedef void (*moe_set_route_fn)(FILE *, int);
 typedef uint64_t (*moe_timer_fn)(void);
+typedef void (*moe_timers_fn)(uint64_t *, uint64_t *, uint64_t *, uint64_t *);
 
 static moe_set_predict_fn g_fn_predict = NULL;
 static moe_set_predict_fn g_fn_predict_match = NULL;
@@ -60,6 +61,7 @@ static moe_set_addr_fn    g_fn_fetch   = NULL;
 static moe_set_prefetch_use_fn g_fn_prefetch_use = NULL;
 static moe_set_route_fn   g_fn_route   = NULL;
 static moe_timer_fn       g_fn_timer   = NULL;
+static moe_timers_fn      g_fn_timers  = NULL;
 
 static void tier_resolve_moe_hooks(void) {
     if (g_fn_predict) {
@@ -81,6 +83,7 @@ static void tier_resolve_moe_hooks(void) {
     g_fn_prefetch_use = (moe_set_prefetch_use_fn) ggml_backend_reg_get_proc_address(reg, "ggml_set_moe_prefetch_use_hook");
     g_fn_route   = (moe_set_route_fn)   ggml_backend_reg_get_proc_address(reg, "ggml_set_route_trace");
     g_fn_timer   = (moe_timer_fn)       ggml_backend_reg_get_proc_address(reg, "ggml_moe_cold_timer_us");
+    g_fn_timers  = (moe_timers_fn)      ggml_backend_reg_get_proc_address(reg, "ggml_moe_cold_timers_us");
 }
 
 #define MOE_PREDICT_HOOK(fn)   do { if (g_fn_predict) g_fn_predict((fn)); } while (0)
@@ -90,6 +93,23 @@ static void tier_resolve_moe_hooks(void) {
 #define MOE_PREFETCH_USE_HOOK(fn) do { if (g_fn_prefetch_use) g_fn_prefetch_use((fn)); } while (0)
 #define MOE_ROUTE_HOOK(f, n)   do { if (g_fn_route)   g_fn_route((f), (n)); } while (0)
 #define MOE_TIMER_HOOK()       (g_fn_timer ? g_fn_timer() : 0)
+
+struct moe_timing_snapshot {
+    uint64_t total = 0;
+    uint64_t setup = 0;
+    uint64_t gate_up = 0;
+    uint64_t activation = 0;
+};
+
+static moe_timing_snapshot moe_timing_snapshot_get() {
+    moe_timing_snapshot result;
+    if (g_fn_timers) {
+        g_fn_timers(&result.total, &result.setup, &result.gate_up, &result.activation);
+    } else {
+        result.total = MOE_TIMER_HOOK();
+    }
+    return result;
+}
 
 // portable atomic access to single i32s inside plain buffers (lut_host must
 // stay a plain i32 vector: it is uploaded wholesale into the GPU lut tensor)
@@ -311,6 +331,7 @@ static uint64_t g_pool_hits = 0, g_pool_cold = 0;
 
 static uint64_t g_fetch_us = 0;   // cumulative wall time in pool_fill() memcpy
 static uint64_t g_steps = 0;      // update() calls (= graph computes)
+static uint64_t g_timing_interval = 0; // LLAMA_EXPERT_TIMING: updates between logs
 static FILE *   g_route_log = nullptr; // actual-routing trace (co-opened with pred log)
 
 // pre-gate predictor: immutable CPU mirrors of each MoE layer's router and
@@ -1224,6 +1245,18 @@ static void dump_stats() {
                         g_pool_cold ? 100.0*(double) g_pool_hits/(double) g_pool_cold : 0.0,
                         (double) g_pool_alloc/(double) (1 << 30));
             }
+            {
+                uint64_t routed = 0;
+                uint64_t hot_hits = 0;
+                for (const auto & L : g_layers) {
+                    routed += L.cum_total;
+                    hot_hits += L.cum_total - L.cum_cold;
+                }
+                fprintf(f, "expert_hot_tier: hits %llu / routed %llu (%.1f%%)\n",
+                        (unsigned long long) hot_hits,
+                        (unsigned long long) routed,
+                        routed ? 100.0*(double) hot_hits/(double) routed : 0.0);
+            }
             if (g_pred.size() >= 2) {
                 const uint64_t prefetch_fills = g_pred_fills.load(std::memory_order_relaxed);
                 const uint64_t prefetch_first_decode_used = g_pred_first_decode_used.load(std::memory_order_relaxed);
@@ -1251,13 +1284,20 @@ static void dump_stats() {
                         (unsigned long long) g_stage_fails.load());
             }
             {
-                const uint64_t cold_us = MOE_TIMER_HOOK();
-                fprintf(f, "expert_timers: steps %llu fetch %llu us (%.2f ms/step) cold_compute %llu us (%.2f ms/step)\n",
+                const moe_timing_snapshot timing = moe_timing_snapshot_get();
+                const uint64_t down_tail = timing.total > timing.setup + timing.gate_up + timing.activation
+                    ? timing.total - timing.setup - timing.gate_up - timing.activation : 0;
+                fprintf(f, "expert_timers: steps %llu pool_fill %llu us (%.2f ms/step) cold_total %llu us (%.2f ms/step)\n",
                         (unsigned long long) g_steps,
                         (unsigned long long) g_fetch_us,
                         g_steps ? (double) g_fetch_us / (double) g_steps / 1000.0 : 0.0,
-                        (unsigned long long) cold_us,
-                        g_steps ? (double) cold_us / (double) g_steps / 1000.0 : 0.0);
+                        (unsigned long long) timing.total,
+                        g_steps ? (double) timing.total / (double) g_steps / 1000.0 : 0.0);
+                fprintf(f, "expert_timers_cold: setup %llu us gate_up %llu us activation %llu us down_and_sync %llu us\n",
+                        (unsigned long long) timing.setup,
+                        (unsigned long long) timing.gate_up,
+                        (unsigned long long) timing.activation,
+                        (unsigned long long) down_tail);
             }
             for (const auto & L : g_layers) {
                 if (L.ws.empty() || L.cum_total == 0) {
@@ -1352,6 +1392,14 @@ void update() {
         g_pool_fill_budget = 16 << 20;
         maybe_update(L);
     }
+    if (g_timing_interval && g_steps % g_timing_interval == 0) {
+        const moe_timing_snapshot timing = moe_timing_snapshot_get();
+        const uint64_t down_tail = timing.total > timing.setup + timing.gate_up + timing.activation
+            ? timing.total - timing.setup - timing.gate_up - timing.activation : 0;
+        TIER_LOG("expert_timers: step %llu pool_fill %.2f ms cold %.2f ms [setup %.2f gate_up %.2f activation %.2f down_and_sync %.2f]\n",
+                (unsigned long long) g_steps, g_fetch_us/1000.0, timing.total/1000.0,
+                timing.setup/1000.0, timing.gate_up/1000.0, timing.activation/1000.0, down_tail/1000.0);
+    }
 }
 
 size_t expert_weight_bytes(const llama_model & model) {
@@ -1429,6 +1477,10 @@ void init(const llama_model & model) {
     if (const char * e = getenv("LLAMA_EXPERT_TMAX")) {
         g_tmax = std::max(0, atoi(e));
     }
+    if (const char * e = getenv("LLAMA_EXPERT_TIMING")) {
+        const int interval = atoi(e);
+        g_timing_interval = interval > 0 ? (uint64_t) interval : 0;
+    }
 
     const int n_layer  = model.hparams.n_layer();
     const int n_expert = model.hparams.n_expert;
@@ -1467,6 +1519,11 @@ void init(const llama_model & model) {
 
     if (getenv("LLAMA_EXPERT_STATS") || getenv("LLAMA_EXPERT_USAGE")) {
         atexit(dump_stats);
+    }
+    if (getenv("LLAMA_EXPERT_STATS") || g_timing_interval) {
+        // The CPU backend may be runtime-loaded. Resolve the timer even when
+        // prediction/pread are disabled, otherwise timing would read as zero.
+        tier_resolve_moe_hooks();
     }
     atexit(save_sidecar);
 

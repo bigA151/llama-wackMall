@@ -168,6 +168,7 @@ a cold start, delete or move the `.tier` file aside before the run.
 | `LLAMA_EXPERT_ADAPT` | 1 | Online adaptation |
 | `LLAMA_EXPERT_DECAY` | 0.999 | Score decay per step (1.0 = cumulative, no aging) |
 | `LLAMA_EXPERT_TMAX` | 16 | Max tokens for tiered hot path |
+| `LLAMA_EXPERT_TIMING` | - | Log cumulative timing every N updates; `1` = every update |
 | `LLAMA_EXPERT_RAMPOOL` | 0 | Demand RAM pool (GiB). 0 = off |
 | `LLAMA_EXPERT_MADVISE` | 1 | Page hints on mmap'd weights |
 | `LLAMA_EXPERT_PREAD` | 1 | pread staging ring for cold weights (0 = plain mmap demand) |
@@ -178,6 +179,24 @@ a cold start, delete or move the `.tier` file aside before the run.
 | `LLAMA_EXPERT_PREDICT_LOG` | - | Path: dump prediction trace (debug) |
 | `LLAMA_EXPERT_STATS` | - | 1 or path: dump stats at exit |
 | `LLAMA_EXPERT_USAGE` | - | Path: dump counts (reusable as seed) |
+
+### Large-prefill experiment
+
+The hot/cold path is enabled for up to `LLAMA_EXPERT_TMAX` tokens per graph;
+the default (`16`) targets decode. The fused `MOE_COLD` kernel also supports
+prefill-shaped graphs, so set a bounded larger value to include them, for
+example in PowerShell:
+
+```powershell
+$env:LLAMA_EXPERT_TMAX = "256"
+$env:LLAMA_EXPERT_TIMING = "1"
+$env:LLAMA_EXPERT_STATS = "1"
+```
+
+Start at 64 or 128 and measure. The cold kernel's temporary workspace grows
+linearly with `TMAX × routed-experts × FFN width`, and CPU cold work can make
+large prefills slower than the stock GPU route; leaving `TMAX=16` preserves
+the stock prefill path while still harvesting routing counts with `MOE_COUNT`.
 
 ## Status
 
