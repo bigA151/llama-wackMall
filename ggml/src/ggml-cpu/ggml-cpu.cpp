@@ -643,6 +643,11 @@ static ggml_backend_feature * ggml_backend_cpu_get_features(ggml_backend_reg_t r
     GGML_UNUSED(reg);
 }
 
+static void ggml_backend_cpu_set_perf_trace(ggml_backend_t backend, bool enabled) {
+    GGML_UNUSED(backend);
+    ggml_set_moe_perf_trace(enabled);
+}
+
 static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     if (strcmp(name, "ggml_backend_set_n_threads") == 0) {
         ggml_backend_set_n_threads_t fct = ggml_backend_cpu_set_n_threads;
@@ -704,6 +709,9 @@ static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (strcmp(name, "ggml_moe_cold_timers_us") == 0) {
         return (void *)ggml_moe_cold_timers_us;
+    }
+    if (strcmp(name, "ggml_backend_set_perf_trace") == 0) {
+        return (void *)ggml_backend_cpu_set_perf_trace;
     }
 
     return NULL;

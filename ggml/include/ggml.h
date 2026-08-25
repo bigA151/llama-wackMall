@@ -1531,6 +1531,8 @@ extern "C" {
                                           uint64_t * gate_up,
                                           uint64_t * activation);
 
+    GGML_API void ggml_set_moe_perf_trace(bool enabled);
+
     // A: m columns, n rows,
     // B: p columns, n rows,
     // result is m columns, p rows

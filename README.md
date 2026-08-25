@@ -159,6 +159,27 @@ and reloads it on init (log: `load_sidecar: loaded sidecar ...`). A sidecar
 present = warm start (higher seed coverage, no re-convergence burst). To force
 a cold start, delete or move the `.tier` file aside before the run.
 
+### Inference performance trace
+
+Add `--perf-trace` to emit one set of detailed wall-clock and Vulkan GPU
+timings per ubatch. The option also enables trace-level logging and can be
+combined with `--log-file`:
+
+```bash
+./bin/llama-cli -m /path/to/moe-model.gguf --perf-trace --log-file perf.log
+```
+
+The main tags are `expert_ssd_read` for actual `pread` calls,
+`expert_pool_fill` for mmap-to-RAM pool copies, `expert_hot_upload` for hot
+expert uploads, `moe_cold` for fused cold-expert CPU phases, `sched_split`
+and `sched_splits` for scheduler wall time, `expert_argsort_host_copy` for
+expert-ID readback, and `gpu_stages` for Vulkan router, argsort, upload, MoE,
+and attention timestamp results. Per-operation and summary records overlap;
+do not add them together as independent costs. Trace mode deliberately adds
+synchronization and should be disabled for normal throughput measurements.
+
+The equivalent environment switch is `LLAMA_ARG_PERF_TRACE=1`.
+
 ### Environment knobs
 
 | Variable | Default | Meaning |

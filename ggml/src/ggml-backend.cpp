@@ -817,6 +817,7 @@ struct ggml_backend_sched {
     size_t context_buffer_size;
 
     bool op_offload;
+    bool perf_trace;
 
     int debug;
 
@@ -1551,6 +1552,18 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
 
+    const int64_t trace_graph_start_us = sched->perf_trace ? ggml_time_us() : 0;
+    int64_t trace_split_total_us = 0;
+    int64_t trace_input_us       = 0;
+    int64_t trace_compute_us     = 0;
+    int64_t trace_sync_us        = 0;
+    int64_t trace_cpu_us         = 0;
+    int64_t trace_gpu_us         = 0;
+    int64_t trace_other_us       = 0;
+    int trace_cpu_splits         = 0;
+    int trace_gpu_splits         = 0;
+    int trace_other_splits       = 0;
+
     ggml_tensor * prev_ids_tensor = nullptr;
     std::vector<int32_t> ids;
     std::vector<ggml_bitset_t> used_ids;
@@ -1559,6 +1572,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
+        const int64_t trace_split_start_us = sched->perf_trace ? ggml_time_us() : 0;
 
         // copy the input tensors to the split backend
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
@@ -1611,9 +1625,20 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     }
 
                     if (ids_tensor != prev_ids_tensor) {
+                        const int64_t trace_copy_start_us = sched->perf_trace ? ggml_time_us() : 0;
                         ids.resize(ggml_nbytes(ids_tensor) / sizeof(int32_t));
                         ggml_backend_tensor_get_async(ids_backend, ids_tensor, ids.data(), 0, ggml_nbytes(ids_tensor));
+                        const int64_t trace_enqueue_end_us = sched->perf_trace ? ggml_time_us() : 0;
                         ggml_backend_synchronize(ids_backend);
+                        if (sched->perf_trace) {
+                            const int64_t trace_copy_end_us = ggml_time_us();
+                            GGML_LOG_INFO("[PERF_TRACE][expert_argsort_host_copy] tensor=%s bytes=%zu "
+                                    "enqueue=%.3f ms synchronize=%.3f ms total=%.3f ms\n",
+                                    ids_tensor->name, ggml_nbytes(ids_tensor),
+                                    (trace_enqueue_end_us - trace_copy_start_us)/1000.0,
+                                    (trace_copy_end_us - trace_enqueue_end_us)/1000.0,
+                                    (trace_copy_end_us - trace_copy_start_us)/1000.0);
+                        }
 
                         // find the used experts
                         used_ids.clear();
@@ -1683,6 +1708,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        const int64_t trace_compute_start_us = sched->perf_trace ? ggml_time_us() : 0;
+
         if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
@@ -1722,12 +1749,67 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        const int64_t trace_compute_end_us = sched->perf_trace ? ggml_time_us() : 0;
+
         // record the event of this copy
         if (split->n_inputs > 0) {
             if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                 ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
             }
         }
+
+        if (sched->perf_trace) {
+            const int64_t trace_sync_start_us = ggml_time_us();
+            ggml_backend_synchronize(split_backend);
+            const int64_t trace_split_end_us = ggml_time_us();
+
+            const int64_t input_us    = trace_compute_start_us - trace_split_start_us;
+            const int64_t compute_us  = trace_compute_end_us - trace_compute_start_us;
+            const int64_t sync_us     = trace_split_end_us - trace_sync_start_us;
+            const int64_t total_us    = trace_split_end_us - trace_split_start_us;
+            const int64_t metadata_us = total_us - input_us - compute_us - sync_us;
+            const int n_nodes = split->graph.n_nodes;
+            const char * first = n_nodes > 0 ? split->graph.nodes[0]->name : "";
+            const char * last  = n_nodes > 0 ? split->graph.nodes[n_nodes - 1]->name : "";
+            const enum ggml_backend_dev_type dev_type = ggml_backend_dev_type(ggml_backend_get_device(split_backend));
+            const char * dev_type_name = "other";
+
+            if (dev_type == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                dev_type_name = "cpu";
+                trace_cpu_us += total_us;
+                trace_cpu_splits++;
+            } else if (dev_type == GGML_BACKEND_DEVICE_TYPE_GPU || dev_type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+                dev_type_name = "gpu";
+                trace_gpu_us += total_us;
+                trace_gpu_splits++;
+            } else {
+                trace_other_us += total_us;
+                trace_other_splits++;
+            }
+
+            trace_split_total_us += total_us;
+            trace_input_us       += input_us;
+            trace_compute_us     += compute_us;
+            trace_sync_us        += sync_us;
+
+            GGML_LOG_INFO("[PERF_TRACE][sched_split] id=%d backend=%s device_type=%s nodes=%d inputs=%d "
+                    "input_copy=%.3f ms compute=%.3f ms synchronize=%.3f ms metadata=%.3f ms total=%.3f ms "
+                    "first=%s last=%s\n",
+                    split_id, ggml_backend_name(split_backend), dev_type_name, n_nodes, split->n_inputs,
+                    input_us/1000.0, compute_us/1000.0, sync_us/1000.0, metadata_us/1000.0, total_us/1000.0,
+                    first, last);
+        }
+    }
+
+    if (sched->perf_trace) {
+        const int64_t graph_wall_us = ggml_time_us() - trace_graph_start_us;
+        const int64_t metadata_us = graph_wall_us - trace_split_total_us;
+        GGML_LOG_INFO("[PERF_TRACE][sched_splits] count=%d cpu_splits=%d gpu_splits=%d other_splits=%d "
+                "input_copy=%.3f ms compute=%.3f ms synchronize=%.3f ms metadata=%.3f ms "
+                "cpu_total=%.3f ms gpu_total=%.3f ms other_total=%.3f ms total=%.3f ms\n",
+                sched->n_splits, trace_cpu_splits, trace_gpu_splits, trace_other_splits,
+                trace_input_us/1000.0, trace_compute_us/1000.0, trace_sync_us/1000.0, metadata_us/1000.0,
+                trace_cpu_us/1000.0, trace_gpu_us/1000.0, trace_other_us/1000.0, graph_wall_us/1000.0);
     }
 
     return GGML_STATUS_SUCCESS;
@@ -1921,6 +2003,11 @@ void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {
         // which avoids changes in the graph that could cause CUDA or other graphs to be disabled
         sched->next_copy = 0;
     }
+}
+
+void ggml_backend_sched_set_perf_trace(ggml_backend_sched_t sched, bool enabled) {
+    GGML_ASSERT(sched);
+    sched->perf_trace = enabled;
 }
 
 void ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data) {

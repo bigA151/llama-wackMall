@@ -334,6 +334,16 @@ static uint64_t g_steps = 0;      // update() calls (= graph computes)
 static uint64_t g_timing_interval = 0; // LLAMA_EXPERT_TIMING: updates between logs
 static FILE *   g_route_log = nullptr; // actual-routing trace (co-opened with pred log)
 
+static std::atomic<bool> g_perf_trace{false};
+static std::atomic<uint64_t> g_trace_ssd_read_us{0};
+static std::atomic<uint64_t> g_trace_ssd_read_bytes{0};
+static std::atomic<uint64_t> g_trace_ssd_reads{0};
+static std::atomic<uint64_t> g_trace_stage_wait_us{0};
+static std::atomic<uint64_t> g_trace_stage_waits{0};
+static std::atomic<uint64_t> g_trace_pool_fill_us{0};
+static std::atomic<uint64_t> g_trace_pool_fill_bytes{0};
+static std::atomic<uint64_t> g_trace_pool_fills{0};
+
 // pre-gate predictor: immutable CPU mirrors of each MoE layer's router and
 // ffn norm weights. The fused cold op reports its router input x through the
 // predict hook; running the NEXT MoE layer's router on x (with its norm
@@ -616,12 +626,20 @@ static const char * stage_fetch(const void * key, int64_t e, const char * fallba
                 }
                 // claimed by another thread: wait for the fill to finish
                 g_stage_stalls.fetch_add(1, std::memory_order_relaxed);
+                const int64_t wait_start = g_perf_trace.load(std::memory_order_relaxed) ? ggml_time_us() : 0;
                 uint64_t v = w;
                 int spins = 0;
                 while ((v = g_stage_word[k].load(std::memory_order_acquire)) == w) {
                     if ((++spins & 0x3FF) == 0) {
                         std::this_thread::yield();
                     }
+                }
+                if (wait_start) {
+                    const uint64_t wait_us = (uint64_t) (ggml_time_us() - wait_start);
+                    g_trace_stage_wait_us.fetch_add(wait_us, std::memory_order_relaxed);
+                    g_trace_stage_waits.fetch_add(1, std::memory_order_relaxed);
+                    LLAMA_LOG_INFO("[PERF_TRACE][expert_stage_wait] layer=%d expert=%lld wait=%.3f ms\n",
+                            c.il, (long long) e, wait_us/1000.0);
                 }
                 if ((v & ~3ull) == mykey && (v & 3) == 2) {
                     return g_stage_base + (size_t) k*g_stage_stride + c.pool_off;
@@ -649,9 +667,18 @@ static const char * stage_fetch(const void * key, int64_t e, const char * fallba
             for (const auto & kv : L.ws) {
                 const size_t slice = ggml_nbytes(kv.first)/L.n_expert;
                 const size_t off = (size_t) ((const char *) kv.first->data - g_stage_mmap) + (size_t) e*slice;
+                const int64_t read_start = g_perf_trace.load(std::memory_order_relaxed) ? ggml_time_us() : 0;
                 if (tier_pread_list(slot + kv.second->pool_off, {{off, slice}}) != (ssize_t) slice) {
                     ok = false;
                     break;
+                }
+                if (read_start) {
+                    const uint64_t read_us = (uint64_t) (ggml_time_us() - read_start);
+                    g_trace_ssd_read_us.fetch_add(read_us, std::memory_order_relaxed);
+                    g_trace_ssd_read_bytes.fetch_add(slice, std::memory_order_relaxed);
+                    g_trace_ssd_reads.fetch_add(1, std::memory_order_relaxed);
+                    LLAMA_LOG_INFO("[PERF_TRACE][expert_ssd_read] layer=%d expert=%lld tensor=%s bytes=%zu read=%.3f ms\n",
+                            c.il, (long long) e, kv.first->name, slice, read_us/1000.0);
                 }
                 total += slice;
             }
@@ -740,10 +767,21 @@ static void prefetch_fill(int pi, int e) {
     L.ownersB[k] = e;
     L.lastB[k].store(step, std::memory_order_relaxed);
     g_work_inflight.fetch_add((int64_t) L.pool_slot_bytes, std::memory_order_relaxed);
+    const int64_t fill_start = g_perf_trace.load(std::memory_order_relaxed) ? ggml_time_us() : 0;
+    size_t fill_bytes = 0;
     for (auto & kv : L.ws) {
         store & st = *kv.second;
         const size_t slice = ggml_nbytes(kv.first)/L.n_expert;
         memcpy(L.poolB + (size_t) k*L.pool_slot_bytes + st.pool_off, (const char *) kv.first->data + slice*e, slice);
+        fill_bytes += slice;
+    }
+    if (fill_start) {
+        const uint64_t fill_us = (uint64_t) (ggml_time_us() - fill_start);
+        g_trace_pool_fill_us.fetch_add(fill_us, std::memory_order_relaxed);
+        g_trace_pool_fill_bytes.fetch_add(fill_bytes, std::memory_order_relaxed);
+        g_trace_pool_fills.fetch_add(1, std::memory_order_relaxed);
+        LLAMA_LOG_INFO("[PERF_TRACE][expert_pool_fill] source=prefetch_mmap layer=%d expert=%d bytes=%zu memcpy=%.3f ms\n",
+                L.il, e, fill_bytes, fill_us/1000.0);
     }
     L.fillB[k].store(g_pred_fill_generation.fetch_add(1, std::memory_order_relaxed) + 1, std::memory_order_release);
     L.stateB[k].store(2, std::memory_order_release);
@@ -914,8 +952,8 @@ static void pred_init(const llama_model & model) {
         MOE_PROBE_HOOK(pregate_probe);
         MOE_PREFETCH_USE_HOOK(pregate_prefetch_use);
         for (int i = 0; i < g_n_workers; i++) {
-            g_workers.emplace_back(prefetch_worker);
         }
+        g_workers.emplace_back(prefetch_worker);
         atexit(pred_shutdown); // registered after dump_stats: runs first (reverse order)
     }
     char wrk[64] = "";
@@ -962,16 +1000,26 @@ static void pool_fill(layer_tier & L, int k, int e) {
         return;
     }
     const int64_t t0 = ggml_time_us();
+    size_t fill_bytes = 0;
     for (auto & kv : L.ws) {
         store & st = *kv.second;
         const size_t slice = ggml_nbytes(kv.first)/L.n_expert;
         const char * src = (const char *) kv.first->data + slice*e;
         memcpy(L.pool + (size_t) k*L.pool_slot_bytes + st.pool_off, src, slice);
+        fill_bytes += slice;
         if (st.poolable) {
             tier_madvise(src, slice, true);
         }
     }
-    g_fetch_us += (uint64_t)(ggml_time_us() - t0);
+    const uint64_t fill_us = (uint64_t)(ggml_time_us() - t0);
+    g_fetch_us += fill_us;
+    if (g_perf_trace.load(std::memory_order_relaxed)) {
+        g_trace_pool_fill_us.fetch_add(fill_us, std::memory_order_relaxed);
+        g_trace_pool_fill_bytes.fetch_add(fill_bytes, std::memory_order_relaxed);
+        g_trace_pool_fills.fetch_add(1, std::memory_order_relaxed);
+        LLAMA_LOG_INFO("[PERF_TRACE][expert_pool_fill] source=demand_mmap layer=%d expert=%d bytes=%zu memcpy=%.3f ms\n",
+                L.il, e, fill_bytes, fill_us/1000.0);
+    }
     L.pool_slot_expert[k] = e;
     L.pool_lut[e] = k;
     L.pool_dwell[k] = 0;
@@ -1159,7 +1207,12 @@ static void maybe_update(layer_tier & L) {
                 // H2D source: the pool copy when resident (its mmap pages are dropped)
                 const char * srcp = st.ptrs ? (const char *) (uintptr_t) ((const int64_t *) st.ptrs->data)[ec]
                                             : (const char *) w->data + slice*ec;
+                const int64_t upload_start = g_perf_trace.load(std::memory_order_relaxed) ? ggml_time_us() : 0;
                 ggml_backend_tensor_set(st.w_hot, srcp, slice*si, slice);
+                if (upload_start) {
+                    LLAMA_LOG_INFO("[PERF_TRACE][expert_hot_upload] layer=%d expert=%d tensor=%s bytes=%zu total=%.3f ms\n",
+                            L.il, ec, st.w_hot->name, slice, (ggml_time_us() - upload_start)/1000.0);
+                }
                 if (st.discardable) {
                     tier_madvise((const char *) w->data + slice*ec, slice, true);
                     if (eold >= 0) {
@@ -1400,6 +1453,58 @@ void update() {
                 (unsigned long long) g_steps, g_fetch_us/1000.0, timing.total/1000.0,
                 timing.setup/1000.0, timing.gate_up/1000.0, timing.activation/1000.0, down_tail/1000.0);
     }
+}
+
+static moe_timing_snapshot g_trace_cold_begin;
+
+void set_perf_trace(bool enabled) {
+    g_perf_trace.store(enabled, std::memory_order_relaxed);
+    if (enabled) {
+        tier_resolve_moe_hooks();
+        LLAMA_LOG_INFO("[PERF_TRACE] expert tier tracing enabled\n");
+    }
+}
+
+void perf_trace_begin() {
+    if (!g_perf_trace.load(std::memory_order_relaxed)) {
+        return;
+    }
+    g_trace_ssd_read_us.store(0, std::memory_order_relaxed);
+    g_trace_ssd_read_bytes.store(0, std::memory_order_relaxed);
+    g_trace_ssd_reads.store(0, std::memory_order_relaxed);
+    g_trace_stage_wait_us.store(0, std::memory_order_relaxed);
+    g_trace_stage_waits.store(0, std::memory_order_relaxed);
+    g_trace_pool_fill_us.store(0, std::memory_order_relaxed);
+    g_trace_pool_fill_bytes.store(0, std::memory_order_relaxed);
+    g_trace_pool_fills.store(0, std::memory_order_relaxed);
+    g_trace_cold_begin = moe_timing_snapshot_get();
+}
+
+void perf_trace_end() {
+    if (!g_perf_trace.load(std::memory_order_relaxed)) {
+        return;
+    }
+    const moe_timing_snapshot end = moe_timing_snapshot_get();
+    const uint64_t cold_us = end.total - g_trace_cold_begin.total;
+    const uint64_t setup_us = end.setup - g_trace_cold_begin.setup;
+    const uint64_t gate_up_us = end.gate_up - g_trace_cold_begin.gate_up;
+    const uint64_t activation_us = end.activation - g_trace_cold_begin.activation;
+    const uint64_t down_sync_us = cold_us > setup_us + gate_up_us + activation_us
+        ? cold_us - setup_us - gate_up_us - activation_us : 0;
+    LLAMA_LOG_INFO("[PERF_TRACE][expert_io_summary] ssd_reads=%llu bytes=%llu read=%.3f ms "
+            "stage_waits=%llu wait=%.3f ms pool_fills=%llu pool_bytes=%llu pool_memcpy=%.3f ms\n",
+            (unsigned long long) g_trace_ssd_reads.load(std::memory_order_relaxed),
+            (unsigned long long) g_trace_ssd_read_bytes.load(std::memory_order_relaxed),
+            g_trace_ssd_read_us.load(std::memory_order_relaxed)/1000.0,
+            (unsigned long long) g_trace_stage_waits.load(std::memory_order_relaxed),
+            g_trace_stage_wait_us.load(std::memory_order_relaxed)/1000.0,
+            (unsigned long long) g_trace_pool_fills.load(std::memory_order_relaxed),
+            (unsigned long long) g_trace_pool_fill_bytes.load(std::memory_order_relaxed),
+            g_trace_pool_fill_us.load(std::memory_order_relaxed)/1000.0);
+    LLAMA_LOG_INFO("[PERF_TRACE][moe_cold_summary] total=%.3f ms setup=%.3f ms gate_up=%.3f ms "
+            "activation=%.3f ms down_and_sync=%.3f ms\n",
+            cold_us/1000.0, setup_us/1000.0, gate_up_us/1000.0,
+            activation_us/1000.0, down_sync_us/1000.0);
 }
 
 size_t expert_weight_bytes(const llama_model & model) {
@@ -1854,6 +1959,7 @@ if (!dev) {
                 continue;
             }
             const size_t bytes = (size_t) L.n_pool_slots*slot;
+            const int64_t alloc_start = g_perf_trace.load(std::memory_order_relaxed) ? ggml_time_us() : 0;
 #if defined(_WIN32)
             L.pool = (char *) _aligned_malloc(bytes, POOL_ALIGN);
 #else
@@ -1863,6 +1969,10 @@ if (!dev) {
             }
             L.pool = (char *) p;
 #endif
+            if (alloc_start) {
+                LLAMA_LOG_INFO("[PERF_TRACE][expert_host_buffer_alloc] kind=demand_pool layer=%d bytes=%zu total=%.3f ms\n",
+                        L.il, bytes, (ggml_time_us() - alloc_start)/1000.0);
+            }
             if (!L.pool) {
                 TIER_LOG("%s: pool alloc failed for layer %d (%zu MiB)\n", __func__, L.il, bytes >> 20);
                 L.n_pool_slots = 0;
@@ -1947,15 +2057,21 @@ if (!dev) {
                 }
             }
             if (g_stage_n > 0) {
+                const size_t bytes = (size_t) g_stage_n*g_stage_stride;
+                const int64_t alloc_start = g_perf_trace.load(std::memory_order_relaxed) ? ggml_time_us() : 0;
 #if defined(_WIN32)
-                g_stage_base = (char *) _aligned_malloc((size_t) g_stage_n*g_stage_stride, page);
+                g_stage_base = (char *) _aligned_malloc(bytes, page);
 #else
                 void * p = nullptr;
-                if (posix_memalign(&p, page, (size_t) g_stage_n*g_stage_stride) != 0) {
+                if (posix_memalign(&p, page, bytes) != 0) {
                     p = nullptr;
                 }
                 g_stage_base = (char *) p;
 #endif
+                if (alloc_start) {
+                    LLAMA_LOG_INFO("[PERF_TRACE][expert_host_buffer_alloc] kind=pread_ring layer=-1 bytes=%zu total=%.3f ms\n",
+                            bytes, (ggml_time_us() - alloc_start)/1000.0);
+                }
                 if (!g_stage_base) {
                     TIER_LOG("%s: pread ring alloc failed (%d x %.2f MiB)\n", __func__,
                             g_stage_n, (double) g_stage_stride/(1024.0*1024.0));
@@ -2008,6 +2124,7 @@ if (!dev) {
                 continue;
             }
             const size_t bytes = (size_t) L.n_slotsB*L.pool_slot_bytes;
+            const int64_t alloc_start = g_perf_trace.load(std::memory_order_relaxed) ? ggml_time_us() : 0;
 #if defined(_WIN32)
             L.poolB = (char *) _aligned_malloc(bytes, POOL_ALIGN);
 #else
@@ -2017,6 +2134,10 @@ if (!dev) {
             }
             L.poolB = (char *) p;
 #endif
+            if (alloc_start) {
+                LLAMA_LOG_INFO("[PERF_TRACE][expert_host_buffer_alloc] kind=prefetch_pool layer=%d bytes=%zu total=%.3f ms\n",
+                        L.il, bytes, (ggml_time_us() - alloc_start)/1000.0);
+            }
             if (!L.poolB) {
                 TIER_LOG("%s: spec pool alloc failed for layer %d (%zu MiB)\n", __func__, L.il, bytes >> 20);
                 L.n_slotsB = 0;

@@ -2127,6 +2127,11 @@ static uint64_t g_moe_cold_us = 0;
 static uint64_t g_moe_cold_setup_us = 0;
 static uint64_t g_moe_cold_gate_up_us = 0;
 static uint64_t g_moe_cold_activation_us = 0;
+static bool g_moe_perf_trace = false;
+
+void ggml_set_moe_perf_trace(bool enabled) {
+    g_moe_perf_trace = enabled;
+}
 
 uint64_t ggml_moe_cold_timer_us(void) {
     return g_moe_cold_us;
@@ -3893,6 +3898,9 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         // TODO: move fused-op detection into ggml_graph_plan so fusion decisions are made once at planning time
         // Try fused ops, fall back to normal compute
         const int64_t t_cold_0 = (state->ith == 0 && node->op == GGML_OP_MOE_COLD) ? ggml_time_us() : 0;
+        const uint64_t setup_0 = t_cold_0 ? g_moe_cold_setup_us : 0;
+        const uint64_t gate_up_0 = t_cold_0 ? g_moe_cold_gate_up_us : 0;
+        const uint64_t activation_0 = t_cold_0 ? g_moe_cold_activation_us : 0;
         const int n_fused = ggml_cpu_try_fuse_ops(cgraph, node_n, &params, cplan);
         if (n_fused > 0) {
             node_n += n_fused;
@@ -3911,7 +3919,20 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         }
 
         if (t_cold_0) {
-            g_moe_cold_us += (uint64_t)(ggml_time_us() - t_cold_0);
+            const uint64_t total_us = (uint64_t)(ggml_time_us() - t_cold_0);
+            const uint64_t setup_us = g_moe_cold_setup_us - setup_0;
+            const uint64_t gate_up_us = g_moe_cold_gate_up_us - gate_up_0;
+            const uint64_t activation_us = g_moe_cold_activation_us - activation_0;
+            const uint64_t down_sync_us = total_us > setup_us + gate_up_us + activation_us
+                ? total_us - setup_us - gate_up_us - activation_us : 0;
+            g_moe_cold_us += total_us;
+            if (g_moe_perf_trace) {
+                GGML_LOG_INFO("[PERF_TRACE][moe_cold] tensor=%s tokens=%lld setup=%.3f ms gate_up=%.3f ms "
+                        "activation=%.3f ms down_and_sync=%.3f ms total=%.3f ms\n",
+                        node->src[2] ? node->src[2]->name : "", (long long) (node->src[4] ? node->src[4]->ne[1] : 0),
+                        setup_us/1000.0, gate_up_us/1000.0, activation_us/1000.0,
+                        down_sync_us/1000.0, total_us/1000.0);
+            }
         }
     }
 

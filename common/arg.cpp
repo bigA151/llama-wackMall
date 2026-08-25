@@ -833,6 +833,11 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
     postprocess_cpu_params(params.speculative.draft.cpuparams,       &params.cpuparams);
     postprocess_cpu_params(params.speculative.draft.cpuparams_batch, &params.cpuparams_batch);
 
+    if (params.perf_trace && params.verbosity < LOG_LEVEL_TRACE) {
+        params.verbosity = LOG_LEVEL_TRACE;
+        common_log_set_verbosity_thold(LOG_LEVEL_TRACE);
+    }
+
     if (params.prompt_cache_all && (params.interactive || params.interactive_first)) {
         throw std::invalid_argument("error: --prompt-cache-all not supported in interactive mode yet\n");
     }
@@ -2676,6 +2681,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
         }
     ).set_env("LLAMA_ARG_N_CPU_MOE"));
+    add_opt(common_arg(
+        {"--perf-trace"},
+        "trace detailed CPU wall-clock and Vulkan GPU timestamp timings for every ubatch",
+        [](common_params & params) {
+            params.perf_trace = true;
+        }
+    ).set_env("LLAMA_ARG_PERF_TRACE"));
     GGML_ASSERT(params.n_gpu_layers < 0); // string_format would need to be extended for a default >= 0
     add_opt(common_arg(
         {"-ngl", "--gpu-layers", "--n-gpu-layers"}, "N",

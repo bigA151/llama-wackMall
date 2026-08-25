@@ -33,6 +33,11 @@ ggml_tensor * build_mul_mat_id(ggml_context * ctx, ggml_tensor * w, ggml_tensor 
 // (LLAMA_EXPERT_ADAPT) repin hot slots; call after each ubatch compute
 void update();
 
+// detailed per-ubatch timing trace
+void set_perf_trace(bool enabled);
+void perf_trace_begin();
+void perf_trace_end();
+
 // total bytes of routed-expert weight tensors (for dense-fit estimates)
 LLAMA_API size_t expert_weight_bytes(const llama_model & model);
 
