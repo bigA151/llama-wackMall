@@ -1769,9 +1769,9 @@ void ggml_set_moe_probe_hook(const char * (*fn)(const void *, int64_t, const cha
 
 // expert tiering: optional per-expert decode-use hook for speculative
 // prefetch effectiveness statistics
-static void (*g_moe_prefetch_use_hook)(const void *, const int64_t *, int64_t, bool) = NULL;
+static void (*g_moe_prefetch_use_hook)(const void *, const int64_t *, int64_t, const struct ggml_tensor *) = NULL;
 
-void ggml_set_moe_prefetch_use_hook(void (*fn)(const void *, const int64_t *, int64_t, bool)) {
+void ggml_set_moe_prefetch_use_hook(void (*fn)(const void *, const int64_t *, int64_t, const struct ggml_tensor *)) {
     g_moe_prefetch_use_hook = fn;
 }
 
@@ -2285,7 +2285,7 @@ static void ggml_compute_forward_moe_cold(
             coff += matrix_row_counts[e];
         }
         if (g_moe_prefetch_use_hook && dst->src[7]) {
-            g_moe_prefetch_use_hook(dst->src[7]->data, matrix_row_counts, n_as, n_tokens == 1);
+            g_moe_prefetch_use_hook(dst->src[7]->data, matrix_row_counts, n_as, ids);
         }
     }
 

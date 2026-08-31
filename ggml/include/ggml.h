@@ -1505,9 +1505,9 @@ extern "C" {
     // returns the READY pool slot address for the expert, else `fallback`
     GGML_API void ggml_set_moe_probe_hook(const char * (*fn)(const void * key, int64_t expert, const char * fallback));
 
-    // expert tiering: optional decode-use hook for speculative prefetches.
-    // Called once per cold MoE op with one entry per expert in `row_counts`.
-    GGML_API void ggml_set_moe_prefetch_use_hook(void (*fn)(const void * key, const int64_t * row_counts, int64_t n_expert, bool is_decode));
+    // expert tiering: optional use hook for speculative prefetches. Called
+    // once per cold MoE op after routing, with the actual routed expert IDs.
+    GGML_API void ggml_set_moe_prefetch_use_hook(void (*fn)(const void * key, const int64_t * row_counts, int64_t n_expert, const struct ggml_tensor * ids));
 
     // expert tiering: optional demand-fetch hook (pread staging ring);
     // returns a staged copy of the expert's weight slice, else `fallback`

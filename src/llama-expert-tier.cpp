@@ -45,7 +45,7 @@ typedef SSIZE_T ssize_t; // POSIX type not provided on Windows
 // (same pattern as llama-context.cpp for ggml_backend_cpu_set_threadpool).
 typedef void (*moe_predict_hook_fn)(const ggml_tensor *, const ggml_tensor *);
 typedef const char * (*moe_addr_hook_fn)(const void *, int64_t, const char *);
-typedef void (*moe_prefetch_use_hook_fn)(const void *, const int64_t *, int64_t, bool);
+typedef void (*moe_prefetch_use_hook_fn)(const void *, const int64_t *, int64_t, const ggml_tensor *);
 
 typedef void (*moe_set_predict_fn)(moe_predict_hook_fn);
 typedef void (*moe_set_addr_fn)(moe_addr_hook_fn);
@@ -346,12 +346,15 @@ static std::atomic<uint64_t> g_trace_pool_fills{0};
 
 // pre-gate predictor: immutable CPU mirrors of each MoE layer's router and
 // ffn norm weights. The fused cold op reports its router input x through the
-// predict hook; running the NEXT MoE layer's router on x (with its norm
-// exactly reconstructed as w_next * (x / w_cur)) predicts that layer's
-// experts one layer ahead of demand. No learned parameters: the predictor
+// predict hook; running physical layer L+4's router on layer L's x (with its
+// norm reconstructed as w_target * (x / w_cur)) predicts that exact layer's
+// experts four layers ahead of demand. No learned parameters: the predictor
 // is the model's own gating function applied early.
+static constexpr int PREGATE_LOOKAHEAD = 4;
+
 struct pred_layer {
     int il = -1;
+    int target_ix = -1;
     int n_routed = 0;
     std::vector<float> norm;
     std::vector<float> gate;
@@ -359,10 +362,14 @@ struct pred_layer {
 
 static std::vector<pred_layer> g_pred;
 static std::unordered_map<const void *, int> g_pred_ix; // counts->data -> g_pred index
+static size_t g_pred_pairs = 0; // source layers with an exact physical L+4 target
 static bool g_predict = false; // LLAMA_EXPERT_PREDICT=1 enables
 static FILE * g_pred_log = nullptr; // LLAMA_EXPERT_PREDICT_LOG (debug)
+static FILE * g_prefetch_log = nullptr; // LLAMA_EXPERT_PREFETCH_LOG (expert-level decode trace)
+static bool g_prefetch_metrics_enabled = false;
 static uint64_t g_pred_pushes = 0;
 static std::vector<std::deque<std::vector<int32_t>>> g_pred_pending; // [layer], one top-K set per token
+static std::vector<std::deque<std::vector<int32_t>>> g_pred_for_use; // matched predictions consumed by use hook
 static uint64_t g_predicted_experts = 0, g_predicted_experts_used = 0;
 
 // prefetch probe: lets a cold op read an expert straight from a READY
@@ -370,6 +377,7 @@ static uint64_t g_predicted_experts = 0, g_predicted_experts_used = 0;
 // keyed by the store's ptrs->data; content is byte-identical either way, so
 // a probe miss costs speed, never correctness.
 struct probe_ctx {
+    int il;
     const std::atomic<int32_t> * lut;
     const std::atomic<int32_t> * states;
     const int32_t * owners;
@@ -382,8 +390,26 @@ static std::atomic<uint64_t> g_probe_hits{0}, g_probe_miss{0};
 static std::atomic<uint64_t> g_pred_fill_generation{0};
 static std::atomic<uint64_t> g_pred_first_decode_used{0};
 
-static void pregate_prefetch_use(const void * key, const int64_t * row_counts, int64_t n_expert, bool is_decode) {
-    if (!is_decode || !row_counts) {
+struct prefetch_coverage_stat {
+    uint64_t used = 0;
+    uint64_t cold = 0;
+    uint64_t hits = 0;
+};
+
+static uint64_t g_prefetch_used = 0;
+static uint64_t g_prefetch_cold_used = 0;
+static uint64_t g_prefetch_ready_used = 0;
+static uint64_t g_prefetch_predicted_move_needed = 0;
+static uint64_t g_prefetch_predicted_ready = 0;
+static std::vector<prefetch_coverage_stat> g_prefetch_by_token;
+static std::vector<prefetch_coverage_stat> g_prefetch_by_layer;
+static int g_prefetch_last_decode_layer = -1;
+static uint64_t g_prefetch_next_decode_token = 0;
+static uint64_t g_prefetch_decode_token = 0;
+
+static void pregate_prefetch_use(
+        const void * key, const int64_t * row_counts, int64_t n_expert, const ggml_tensor * ids) {
+    if (!row_counts || !ids || !ids->data) {
         return;
     }
     auto it = g_probe_ix.find(key);
@@ -391,24 +417,97 @@ static void pregate_prefetch_use(const void * key, const int64_t * row_counts, i
         return;
     }
     const probe_ctx & c = it->second;
-    for (const auto & L : g_layers) {
-        if (L.lutB.get() != c.lut || L.n_expert != n_expert) {
+    if (c.il < 0 || c.il >= (int) g_layers.size()) {
+        return;
+    }
+    layer_tier & L = g_layers[c.il];
+    if (L.lutB.get() != c.lut || L.n_expert != n_expert) {
+        return;
+    }
+
+    const int64_t n_tokens = ids->ne[1];
+    std::vector<std::vector<int32_t>> predicted((size_t) n_tokens);
+    if (c.il < (int) g_pred_for_use.size()) {
+        auto & pending = g_pred_for_use[c.il];
+        for (int64_t t = 0; t < n_tokens && !pending.empty(); t++) {
+            predicted[(size_t) t] = std::move(pending.front());
+            pending.pop_front();
+        }
+    }
+
+    // Requested coverage metrics are decode-only. Prompt batches are still
+    // consumed above so their prediction records cannot leak into decode.
+    if (n_tokens != 1 || !g_prefetch_metrics_enabled) {
+        return;
+    }
+
+    if (g_prefetch_last_decode_layer < 0 || c.il <= g_prefetch_last_decode_layer) {
+        g_prefetch_decode_token = g_prefetch_next_decode_token++;
+        g_prefetch_by_token.emplace_back();
+    }
+    g_prefetch_last_decode_layer = c.il;
+    if ((int) g_prefetch_by_layer.size() <= c.il) {
+        g_prefetch_by_layer.resize((size_t) c.il + 1);
+    }
+
+    prefetch_coverage_stat & token_stat = g_prefetch_by_token[(size_t) g_prefetch_decode_token];
+    prefetch_coverage_stat & layer_stat = g_prefetch_by_layer[(size_t) c.il];
+    for (int64_t id = 0; id < ids->ne[0]; id++) {
+        const int32_t e = *(const int32_t *) ((const char *) ids->data + id*ids->nb[0]);
+        if (e < 0 || e >= n_expert) {
             continue;
         }
-        for (int k = 0; k < L.n_slotsB; k++) {
-            if (L.stateB[k].load(std::memory_order_acquire) < 2) {
-                continue;
-            }
-            const uint64_t generation = L.fillB[k].load(std::memory_order_acquire);
-            if (generation == 0 || L.checkedB[k].exchange(generation, std::memory_order_acq_rel) == generation) {
-                continue;
-            }
-            const int32_t e = L.ownersB[k];
-            if (e >= 0 && e < n_expert && row_counts[e] > 0) {
-                g_pred_first_decode_used.fetch_add(1, std::memory_order_relaxed);
+        const bool was_predicted = std::find(predicted[0].begin(), predicted[0].end(), e) != predicted[0].end();
+        const bool is_cold = tier_atomic_load_i32(&L.lut_host[e]) == L.sentinel;
+        const bool demand_cached = is_cold && L.pool_lut && L.pool_lut[e].load(std::memory_order_acquire) >= 0;
+        const bool move_needed = is_cold && !demand_cached;
+        bool ready_at_need = false;
+        if (is_cold) {
+            const int32_t k = L.lutB[e].load(std::memory_order_acquire);
+            ready_at_need = k >= 0 && L.stateB[k].load(std::memory_order_acquire) >= 2 && L.ownersB[k] == e;
+        }
+
+        g_prefetch_used++;
+        token_stat.used++;
+        layer_stat.used++;
+        if (is_cold) {
+            g_prefetch_cold_used++;
+            token_stat.cold++;
+            layer_stat.cold++;
+            if (was_predicted && move_needed) {
+                g_prefetch_predicted_move_needed++;
             }
         }
-        return;
+        if (ready_at_need) {
+            g_prefetch_ready_used++;
+            token_stat.hits++;
+            layer_stat.hits++;
+            if (was_predicted && move_needed) {
+                g_prefetch_predicted_ready++;
+            }
+        }
+        if (g_prefetch_log) {
+            fprintf(g_prefetch_log, "%llu,%d,%d,%d,%d,%d,%d\n",
+                    (unsigned long long) g_prefetch_decode_token, c.il, e,
+                    was_predicted ? 1 : 0, is_cold ? 1 : 0,
+                    demand_cached ? 1 : 0, ready_at_need ? 1 : 0);
+        }
+    }
+
+    // Preserve the original fill-centric effectiveness metric: each completed
+    // fill is checked once, at its first decode opportunity.
+    for (int k = 0; k < L.n_slotsB; k++) {
+        if (L.stateB[k].load(std::memory_order_acquire) < 2) {
+            continue;
+        }
+        const uint64_t generation = L.fillB[k].load(std::memory_order_acquire);
+        if (generation == 0 || L.checkedB[k].exchange(generation, std::memory_order_acq_rel) == generation) {
+            continue;
+        }
+        const int32_t e = L.ownersB[k];
+        if (e >= 0 && e < n_expert && row_counts[e] > 0) {
+            g_pred_first_decode_used.fetch_add(1, std::memory_order_relaxed);
+        }
     }
 }
 
@@ -426,7 +525,7 @@ static void pregate_predict_match(const ggml_tensor * counts, const ggml_tensor 
     }
     auto & pending = g_pred_pending[il];
     for (int64_t t = 0; t < ids->ne[1] && !pending.empty(); t++) {
-        const std::vector<int32_t> predicted = std::move(pending.front());
+        std::vector<int32_t> predicted = std::move(pending.front());
         pending.pop_front();
         g_predicted_experts += predicted.size();
         for (const int32_t e : predicted) {
@@ -437,6 +536,9 @@ static void pregate_predict_match(const ggml_tensor * counts, const ggml_tensor 
                     break;
                 }
             }
+        }
+        if (il < (int) g_pred_for_use.size()) {
+            g_pred_for_use[il].emplace_back(std::move(predicted));
         }
     }
 }
@@ -717,7 +819,7 @@ static std::atomic<uint64_t> g_pred_step{0}; // window tick for lastB timestamps
 static uint64_t g_predB_evict = 0; // timestamp evictions by the window
 static std::atomic<uint64_t> g_pred_fills{0};
 static uint64_t g_pred_published = 0;
-static uint64_t g_pred_drop_hot = 0, g_pred_drop_dup = 0, g_pred_drop_budget = 0, g_pred_drop_full = 0;
+static std::atomic<uint64_t> g_pred_drop_hot{0}, g_pred_drop_dup{0}, g_pred_drop_budget{0}, g_pred_drop_full{0};
 
 static void prefetch_fill(int pi, int e) {
     layer_tier & L = g_layers[g_pred[pi].il];
@@ -822,30 +924,33 @@ static void pregate_hook(const ggml_tensor * counts, const ggml_tensor * x) {
         return;
     }
     auto it = g_pred_ix.find(counts->data);
-    if (it == g_pred_ix.end() || it->second + 1 >= (int) g_pred.size()) {
+    if (it == g_pred_ix.end()) {
         return;
     }
     const pred_layer & cur = g_pred[it->second];
-    const pred_layer & nxt = g_pred[it->second + 1];
-    const int64_t ne0 = x->ne[0];
-    if ((int64_t) cur.norm.size() != ne0 || (int64_t) nxt.norm.size() != ne0) {
+    if (cur.target_ix < 0) {
         return;
     }
-    const int64_t n_exp = (int64_t) (nxt.gate.size()/ne0);
+    const pred_layer & target = g_pred[cur.target_ix];
+    const int64_t ne0 = x->ne[0];
+    if ((int64_t) cur.norm.size() != ne0 || (int64_t) target.norm.size() != ne0) {
+        return;
+    }
+    const int64_t n_exp = (int64_t) (target.gate.size()/ne0);
     thread_local std::vector<float> hv, lg;
     thread_local std::vector<int32_t> idx;
     hv.resize(ne0);
     lg.resize(n_exp);
     idx.resize(n_exp);
-    const int K = nxt.n_routed;
+    const int K = target.n_routed;
     for (int64_t t = 0; t < x->ne[1]; t++) {
         const float * xt = (const float *) ((const char *) x->data + t*x->nb[1]);
         for (int64_t i = 0; i < ne0; i++) {
             const float w = cur.norm[i];
-            hv[i] = nxt.norm[i]*(w*w > 1e-12f ? xt[i]/w : 0.0f);
+            hv[i] = target.norm[i]*(w*w > 1e-12f ? xt[i]/w : 0.0f);
         }
         for (int64_t e = 0; e < n_exp; e++) {
-            const float * g = nxt.gate.data() + (size_t) e*ne0;
+            const float * g = target.gate.data() + (size_t) e*ne0;
             float s = 0.0f;
             for (int64_t i = 0; i < ne0; i++) {
                 s += g[i]*hv[i];
@@ -859,10 +964,10 @@ static void pregate_hook(const ggml_tensor * counts, const ggml_tensor * x) {
                 [&](int32_t a, int32_t b) { return lg[a] > lg[b]; });
         if (!g_pred_pending.empty()) {
             std::vector<int32_t> predicted(idx.begin(), idx.begin() + K);
-            g_pred_pending[nxt.il].emplace_back(std::move(predicted));
+            g_pred_pending[target.il].emplace_back(std::move(predicted));
         }
         if (g_pred_log) {
-            fprintf(g_pred_log, "%llu,%lld,%d", (unsigned long long) cur_seq, (long long) x->ne[1], nxt.il);
+            fprintf(g_pred_log, "%llu,%lld,%d", (unsigned long long) cur_seq, (long long) x->ne[1], target.il);
             for (int k = 0; k < K; k++) {
                 fprintf(g_pred_log, ",%d", idx[k]);
             }
@@ -871,12 +976,12 @@ static void pregate_hook(const ggml_tensor * counts, const ggml_tensor * x) {
         if (!g_workers.empty()) {
             std::lock_guard<std::mutex> lk(g_work_mu);
             if (g_work_q.size() < 4096) {
-                layer_tier & LT = g_layers[nxt.il];
+                layer_tier & LT = g_layers[target.il];
                 for (int k = 0; k < K; k++) {
                     if (LT.pool_lut && LT.pool_lut[idx[k]].load(std::memory_order_relaxed) >= 0) {
                         continue; // already in demand pool
                     }
-                    g_work_q.emplace_back((int32_t) (it->second + 1), idx[k]);
+                    g_work_q.emplace_back((int32_t) cur.target_ix, idx[k]);
                 }
             }
         }
@@ -924,13 +1029,25 @@ static void pred_init(const llama_model & model) {
         g_pred.push_back(std::move(pl));
         mirror_bytes += (size_t) (n_exp + 1)*ne0*sizeof(float);
     }
-    const bool want_worker = g_predict && g_poolB_bytes > 0 && g_pred.size() >= 2;
-    const bool want_predict_accuracy = g_predict && getenv("LLAMA_EXPERT_STATS") != nullptr;
-    if (g_pred.size() >= 2 && (g_pred_log || want_worker || want_predict_accuracy)) {
+    std::vector<int> pred_ix_by_layer(n_layer, -1);
+    for (int pi = 0; pi < (int) g_pred.size(); pi++) {
+        pred_ix_by_layer[g_pred[pi].il] = pi;
+    }
+    for (pred_layer & source : g_pred) {
+        const int target_il = source.il + PREGATE_LOOKAHEAD;
+        if (target_il < n_layer && pred_ix_by_layer[target_il] >= 0) {
+            source.target_ix = pred_ix_by_layer[target_il];
+            g_pred_pairs++;
+        }
+    }
+    const bool want_worker = g_predict && g_poolB_bytes > 0 && g_pred_pairs > 0;
+    const bool want_predict_accuracy = g_predict && g_prefetch_metrics_enabled;
+    if (g_pred_pairs > 0 && (g_pred_log || want_worker || want_predict_accuracy)) {
         tier_resolve_moe_hooks();
         MOE_PREDICT_HOOK(pregate_hook);
         if (want_predict_accuracy) {
             g_pred_pending.resize(model.hparams.n_layer());
+            g_pred_for_use.resize(model.hparams.n_layer());
             MOE_PREDICT_MATCH_HOOK(pregate_predict_match);
         }
     }
@@ -944,7 +1061,7 @@ static void pred_init(const llama_model & model) {
             if (!L.poolB || L.n_slotsB <= 0) {
                 continue;
             }
-            probe_ctx c{ L.lutB.get(), L.stateB.get(), L.ownersB.data(),
+            probe_ctx c{ L.il, L.lutB.get(), L.stateB.get(), L.ownersB.data(),
                          L.poolB, (int64_t) L.pool_slot_bytes, (int64_t) st.pool_off };
             g_probe_ix[st.ptrs->data] = c;
         }
@@ -952,17 +1069,17 @@ static void pred_init(const llama_model & model) {
         MOE_PROBE_HOOK(pregate_probe);
         MOE_PREFETCH_USE_HOOK(pregate_prefetch_use);
         for (int i = 0; i < g_n_workers; i++) {
+            g_workers.emplace_back(prefetch_worker);
         }
-        g_workers.emplace_back(prefetch_worker);
         atexit(pred_shutdown); // registered after dump_stats: runs first (reverse order)
     }
     char wrk[64] = "";
     if (want_worker) {
         snprintf(wrk, sizeof(wrk), ", prefetching (%d threads)", g_n_workers);
     }
-    TIER_LOG("%s: pre-gate predictor: %zu layers, %.1f MiB mirrors%s\n", __func__,
-            g_pred.size(), (double) mirror_bytes/(1024.0*1024.0),
-            want_worker ? wrk : (g_pred.size() >= 2 && g_pred_log ? ", logging" : " (inactive)"));
+    TIER_LOG("%s: pre-gate predictor: %zu layers, %zu exact L+%d routes, %.1f MiB mirrors%s\n", __func__,
+            g_pred.size(), g_pred_pairs, PREGATE_LOOKAHEAD, (double) mirror_bytes/(1024.0*1024.0),
+            want_worker ? wrk : (g_pred_pairs > 0 && g_pred_log ? ", logging" : " (inactive)"));
 }
 
 
@@ -1310,15 +1427,17 @@ static void dump_stats() {
                         (unsigned long long) routed,
                         routed ? 100.0*(double) hot_hits/(double) routed : 0.0);
             }
-            if (g_pred.size() >= 2) {
+            if (g_pred_pairs > 0) {
                 const uint64_t prefetch_fills = g_pred_fills.load(std::memory_order_relaxed);
                 const uint64_t prefetch_first_decode_used = g_pred_first_decode_used.load(std::memory_order_relaxed);
                 fprintf(f, "expert_predict: pushes %llu fills %llu published %llu specevict %llu probe %llu/%llu drop hot %llu dup %llu budget %llu full %llu\n",
                         (unsigned long long) g_pred_pushes, (unsigned long long) prefetch_fills,
                         (unsigned long long) g_pred_published, (unsigned long long) g_predB_evict,
                         (unsigned long long) g_probe_hits.load(), (unsigned long long) g_probe_miss.load(),
-                        (unsigned long long) g_pred_drop_hot, (unsigned long long) g_pred_drop_dup,
-                        (unsigned long long) g_pred_drop_budget, (unsigned long long) g_pred_drop_full);
+                        (unsigned long long) g_pred_drop_hot.load(std::memory_order_relaxed),
+                        (unsigned long long) g_pred_drop_dup.load(std::memory_order_relaxed),
+                        (unsigned long long) g_pred_drop_budget.load(std::memory_order_relaxed),
+                        (unsigned long long) g_pred_drop_full.load(std::memory_order_relaxed));
                 fprintf(f, "expert_prefetch_effectiveness: first_decode_used %llu / completed %llu (%.1f%%)\n",
                         (unsigned long long) prefetch_first_decode_used,
                         (unsigned long long) prefetch_fills,
@@ -1327,6 +1446,34 @@ static void dump_stats() {
                         (unsigned long long) g_predicted_experts_used,
                         (unsigned long long) g_predicted_experts,
                         g_predicted_experts ? 100.0*(double) g_predicted_experts_used/(double) g_predicted_experts : 0.0);
+                fprintf(f, "expert_prefetch_timeliness: ready_at_need %llu / predicted_move_needed %llu (%.1f%%)\n",
+                        (unsigned long long) g_prefetch_predicted_ready,
+                        (unsigned long long) g_prefetch_predicted_move_needed,
+                        g_prefetch_predicted_move_needed ? 100.0*(double) g_prefetch_predicted_ready/(double) g_prefetch_predicted_move_needed : 0.0);
+                fprintf(f, "expert_prefetch_coverage: ready_at_need %llu / routed_used %llu (%.1f%%), cold %llu / %llu (%.1f%%)\n",
+                        (unsigned long long) g_prefetch_ready_used,
+                        (unsigned long long) g_prefetch_used,
+                        g_prefetch_used ? 100.0*(double) g_prefetch_ready_used/(double) g_prefetch_used : 0.0,
+                        (unsigned long long) g_prefetch_ready_used,
+                        (unsigned long long) g_prefetch_cold_used,
+                        g_prefetch_cold_used ? 100.0*(double) g_prefetch_ready_used/(double) g_prefetch_cold_used : 0.0);
+                for (size_t token = 0; token < g_prefetch_by_token.size(); token++) {
+                    const prefetch_coverage_stat & s = g_prefetch_by_token[token];
+                    fprintf(f, "expert_prefetch_token %zu: hits %llu / cold %llu (%.1f%%), routed %llu\n",
+                            token, (unsigned long long) s.hits, (unsigned long long) s.cold,
+                            s.cold ? 100.0*(double) s.hits/(double) s.cold : 0.0,
+                            (unsigned long long) s.used);
+                }
+                for (size_t layer = 0; layer < g_prefetch_by_layer.size(); layer++) {
+                    const prefetch_coverage_stat & s = g_prefetch_by_layer[layer];
+                    fprintf(f, "expert_prefetch_layer %zu: hits %llu / cold %llu (%.1f%%), routed %llu\n",
+                            layer, (unsigned long long) s.hits, (unsigned long long) s.cold,
+                            s.cold ? 100.0*(double) s.hits/(double) s.cold : 0.0,
+                            (unsigned long long) s.used);
+                }
+                if (g_prefetch_log) {
+                    fflush(g_prefetch_log);
+                }
             }
             if (g_stage_n > 0) {
                 fprintf(f, "expert_pread: fetches %llu bytes %llu stalls %llu fallbacks %llu fails %llu\n",
@@ -1559,6 +1706,17 @@ void init(const llama_model & model) {
             }
         }
     }
+    if (const char * e = getenv("LLAMA_EXPERT_PREFETCH_LOG")) {
+        if (e[0]) {
+            g_prefetch_log = fopen(e, "w");
+            if (!g_prefetch_log) {
+                TIER_LOG("%s: cannot open prefetch log '%s'\n", __func__, e);
+            } else {
+                fprintf(g_prefetch_log, "token,layer,expert,predicted,cold,demand_cached,ready_at_need\n");
+            }
+        }
+    }
+    g_prefetch_metrics_enabled = g_prefetch_log != nullptr || getenv("LLAMA_EXPERT_STATS") != nullptr;
     if (const char * e = getenv("LLAMA_EXPERT_PREFETCH_MB")) {
         g_work_budget = (int64_t) (atof(e)*1048576.0);
     }
