@@ -646,7 +646,7 @@ int cli_context::run() {
 
         if (params.show_timings) {
             ui::show_info(string_format(
-                "\n[ Prompt: %.1f t/s | Generation: %.1f t/s ]",
+                "\n[ Prompt: %.3f t/s | Generation: %.3f t/s ]",
                 timings.prompt_per_second,
                 timings.predicted_per_second
             ));
