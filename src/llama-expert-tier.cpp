@@ -407,6 +407,7 @@ struct prefetch_request {
     int expert = -1;
     int slot = -1;
     uint64_t prediction_id = 0;
+    int prediction_rank = -1;
     std::atomic<int32_t> state{PREFETCH_QUEUED};
     std::atomic<bool> cancel{false};
     std::atomic<bool> demand{false};
@@ -471,6 +472,12 @@ static std::atomic<uint64_t> g_residency_prefetch_ready{0};
 static std::atomic<uint64_t> g_residency_prefetch_filling{0};
 static std::atomic<uint64_t> g_residency_enqueued{0};
 static std::atomic<uint64_t> g_prediction_tickets_with_io{0};
+static constexpr int PREFETCH_RANK_STATS = 8;
+static std::atomic<uint64_t> g_rank_selected[PREFETCH_RANK_STATS]{};
+static std::atomic<uint64_t> g_rank_used[PREFETCH_RANK_STATS]{};
+static std::atomic<uint64_t> g_rank_enqueued[PREFETCH_RANK_STATS]{};
+static std::atomic<uint64_t> g_rank_correct_bytes[PREFETCH_RANK_STATS]{};
+static std::atomic<uint64_t> g_rank_wrong_bytes[PREFETCH_RANK_STATS]{};
 static std::atomic<uint64_t> g_prefetch_duplicate_claims{0};
 static std::atomic<uint64_t> g_prefetch_partial_probe_rejects{0};
 static std::atomic<uint64_t> g_hot_stale_unpins{0};
@@ -896,6 +903,10 @@ static void account_prefetch_bytes(const std::shared_ptr<prefetch_request> & req
     }
     const uint64_t bytes = req->bytes_filled.load(std::memory_order_acquire);
     (correct ? g_prefetch_correct_bytes : g_prefetch_wrong_bytes).fetch_add(bytes, std::memory_order_relaxed);
+    if (req->prediction_rank >= 0 && req->prediction_rank < PREFETCH_RANK_STATS) {
+        (correct ? g_rank_correct_bytes[req->prediction_rank] :
+                g_rank_wrong_bytes[req->prediction_rank]).fetch_add(bytes, std::memory_order_relaxed);
+    }
 }
 
 static uint64_t prefetch_key(int il, int e) {
@@ -941,7 +952,7 @@ static bool pin_hot_expert(prediction_ticket & ticket, layer_tier & L, int e) {
 }
 
 static const char * classify_prediction_locked(
-        const std::shared_ptr<prediction_ticket> & ticket, int target_pi, int e) {
+        const std::shared_ptr<prediction_ticket> & ticket, int target_pi, int e, int rank) {
     layer_tier & L = g_layers[g_pred[target_pi].il];
     if (pin_hot_expert(*ticket, L, e)) {
         g_pred_drop_hot.fetch_add(1, std::memory_order_relaxed);
@@ -982,6 +993,7 @@ static const char * classify_prediction_locked(
     req->il = L.il;
     req->expert = e;
     req->prediction_id = ticket->id;
+    req->prediction_rank = rank;
     ticket->requests.push_back(req);
     {
         std::lock_guard<std::mutex> lk(g_work_mu);
@@ -994,6 +1006,9 @@ static const char * classify_prediction_locked(
     }
     g_work_cv.notify_one();
     g_residency_enqueued.fetch_add(1, std::memory_order_relaxed);
+    if (rank >= 0 && rank < PREFETCH_RANK_STATS) {
+        g_rank_enqueued[rank].fetch_add(1, std::memory_order_relaxed);
+    }
     return "NONE_ENQUEUED";
 }
 
@@ -1284,8 +1299,9 @@ static void compute_prediction(const std::shared_ptr<prediction_ticket> & ticket
             ticket->compute_end_us - ticket->compute_start_us);
     if (!g_prefetch_calibrate) {
         bool queued_physical_io = false;
-        for (int e : ticket->selected) {
-            const char * residency = classify_prediction_locked(ticket, ticket->target_pi, e);
+        for (size_t rank = 0; rank < ticket->selected.size(); rank++) {
+            const int e = ticket->selected[rank];
+            const char * residency = classify_prediction_locked(ticket, ticket->target_pi, e, (int) rank);
             ticket->residency.emplace_back(residency);
             queued_physical_io = queued_physical_io || strcmp(residency, "NONE_ENQUEUED") == 0;
         }
@@ -1394,9 +1410,16 @@ static void pregate_predict_match(const ggml_tensor * counts, const ggml_tensor 
             return;
         }
         g_predicted_experts += ticket->selected.size();
-        for (int e : ticket->selected) {
+        for (size_t rank = 0; rank < ticket->selected.size(); rank++) {
+            const int e = ticket->selected[rank];
             if (ticket_actual_contains(*ticket, e)) {
                 g_predicted_experts_used++;
+            }
+            if (rank < PREFETCH_RANK_STATS) {
+                g_rank_selected[rank].fetch_add(1, std::memory_order_relaxed);
+                if (ticket_actual_contains(*ticket, e)) {
+                    g_rank_used[rank].fetch_add(1, std::memory_order_relaxed);
+                }
             }
         }
         for (hot_pin_ref & pin : ticket->hot_pins) {
@@ -2050,6 +2073,15 @@ static void dump_stats() {
                         (unsigned long long) g_residency_enqueued.load(std::memory_order_relaxed),
                         (unsigned long long) g_prefetch_copy_us.load(std::memory_order_relaxed),
                         (unsigned long long) g_prediction_skipped_low_cold.load(std::memory_order_relaxed));
+                for (int rank = 0; rank < std::min(g_prefetch_max, PREFETCH_RANK_STATS); rank++) {
+                    fprintf(f, "expert_prediction_rank %d: selected %llu used %llu enqueued %llu correct_bytes %llu wrong_bytes %llu\n",
+                            rank + 1,
+                            (unsigned long long) g_rank_selected[rank].load(std::memory_order_relaxed),
+                            (unsigned long long) g_rank_used[rank].load(std::memory_order_relaxed),
+                            (unsigned long long) g_rank_enqueued[rank].load(std::memory_order_relaxed),
+                            (unsigned long long) g_rank_correct_bytes[rank].load(std::memory_order_relaxed),
+                            (unsigned long long) g_rank_wrong_bytes[rank].load(std::memory_order_relaxed));
+                }
                 fprintf(f, "expert_prefetch_lifecycle: merges %llu cancel_requests %llu expired %llu demand_deferred %llu hot_eviction_blocks %llu\n",
                         (unsigned long long) g_prefetch_merges.load(std::memory_order_relaxed),
                         (unsigned long long) g_prefetch_cancel_requests.load(std::memory_order_relaxed),
