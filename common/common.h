@@ -476,6 +476,10 @@ struct common_params {
     int32_t main_gpu           = 0;     // the GPU that is used for scratch and small tensors
     float   tensor_split[128]  = {0};   // how split tensors should be distributed across GPUs
     bool    cmoe               = true;  // enable expert tiering (-no-cmoe to disable)
+    int32_t expert_prefetch_slots    = -1; // speculative slots per MoE layer (-1 = legacy GiB budget)
+    int32_t expert_prefetch_max      =  3; // maximum experts selected by one prediction
+    int32_t expert_prefetch_chunk_mb =  4; // cooperative cancellation granularity
+    bool    expert_prefetch_calibrate = false; // predict and log without physical prefetch
     bool    fit_params         = true;  // whether to fit unset model/context parameters to free device memory
     bool    fit_params_print   = false; // print the estimated required memory to run the model
     int32_t fit_params_min_ctx = 4096;  // minimum context size to set when trying to reduce memory use

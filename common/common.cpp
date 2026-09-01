@@ -1349,6 +1349,12 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
 #endif
     }
 
+    llama_expert_tier::configure_prefetch(
+            params.expert_prefetch_slots,
+            params.expert_prefetch_max,
+            params.expert_prefetch_chunk_mb,
+            params.expert_prefetch_calibrate);
+
     llama_context * lctx = llama_init_from_model(model, cparams);
     if (lctx == NULL) {
         COM_ERR("failed to create context with model '%s'\n", params.model.path.c_str());

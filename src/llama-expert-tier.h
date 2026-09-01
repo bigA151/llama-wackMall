@@ -20,6 +20,11 @@ struct llama_model;
 
 namespace llama_expert_tier {
 
+// Apply command-line prefetch overrides before the first context initializes
+// the process-global expert tier. A negative slot count preserves the legacy
+// LLAMA_EXPERT_PREFETCH_GB allocation behavior.
+LLAMA_API void configure_prefetch(int slots_per_layer, int max_experts, int chunk_mb, bool calibrate);
+
 // call once after the model tensors are loaded; no-op unless LLAMA_EXPERT_HOT is set
 void init(const llama_model & model);
 

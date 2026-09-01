@@ -2667,6 +2667,43 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_NO_CPU_MOE"));
     add_opt(common_arg(
+        {"--expert-prefetch-slots"}, "N",
+        "speculative expert slots to allocate independently for every MoE layer",
+        [](common_params & params, int value) {
+            if (value <= 0) {
+                throw std::invalid_argument("expert prefetch slots must be greater than zero");
+            }
+            params.expert_prefetch_slots = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--expert-prefetch-max"}, "N",
+        "maximum experts selected by one router prediction (default: 3)",
+        [](common_params & params, int value) {
+            if (value <= 0) {
+                throw std::invalid_argument("expert prefetch maximum must be greater than zero");
+            }
+            params.expert_prefetch_max = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--expert-prefetch-chunk-mb"}, "N",
+        "prefetch copy chunk size in MiB for cooperative cancellation (default: 4)",
+        [](common_params & params, int value) {
+            if (value <= 0) {
+                throw std::invalid_argument("expert prefetch chunk size must be greater than zero");
+            }
+            params.expert_prefetch_chunk_mb = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--expert-prefetch-calibrate"},
+        "log router confidence and actual routes without copying expert weights",
+        [](common_params & params) {
+            params.expert_prefetch_calibrate = true;
+        }
+    ));
+    add_opt(common_arg(
         {"-ncmoe", "--n-cpu-moe"}, "N",
         "keep the Mixture of Experts (MoE) weights of the first N layers in the CPU",
         [](common_params & params, int value) {
