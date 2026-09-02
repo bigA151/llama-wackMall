@@ -1531,6 +1531,15 @@ extern "C" {
                                           uint64_t * gate_up,
                                           uint64_t * activation);
 
+    // Expert-tier predictor helper. Kept behind the CPU backend registry so
+    // callers under GGML_BACKEND_DL use the same ISA-specialized dot kernel as
+    // the selected CPU backend instead of compiling a second scalar matvec.
+    GGML_API void ggml_moe_matvec_f32(const float * matrix,
+                                      const float * x,
+                                      float * dst,
+                                      int64_t rows,
+                                      int64_t cols);
+
     GGML_API void ggml_set_moe_perf_trace(bool enabled);
 
     // A: m columns, n rows,

@@ -55,6 +55,7 @@ typedef void (*moe_set_prefetch_use_fn)(moe_prefetch_use_hook_fn);
 typedef void (*moe_set_route_fn)(FILE *, int);
 typedef uint64_t (*moe_timer_fn)(void);
 typedef void (*moe_timers_fn)(uint64_t *, uint64_t *, uint64_t *, uint64_t *);
+typedef void (*moe_matvec_f32_fn)(const float *, const float *, float *, int64_t, int64_t);
 
 static moe_set_predict_fn g_fn_predict = NULL;
 static moe_set_predict_fn g_fn_predict_match = NULL;
@@ -64,6 +65,7 @@ static moe_set_prefetch_use_fn g_fn_prefetch_use = NULL;
 static moe_set_route_fn   g_fn_route   = NULL;
 static moe_timer_fn       g_fn_timer   = NULL;
 static moe_timers_fn      g_fn_timers  = NULL;
+static moe_matvec_f32_fn  g_fn_matvec  = NULL;
 
 static void tier_resolve_moe_hooks(void) {
     if (g_fn_predict) {
@@ -86,6 +88,7 @@ static void tier_resolve_moe_hooks(void) {
     g_fn_route   = (moe_set_route_fn)   ggml_backend_reg_get_proc_address(reg, "ggml_set_route_trace");
     g_fn_timer   = (moe_timer_fn)       ggml_backend_reg_get_proc_address(reg, "ggml_moe_cold_timer_us");
     g_fn_timers  = (moe_timers_fn)      ggml_backend_reg_get_proc_address(reg, "ggml_moe_cold_timers_us");
+    g_fn_matvec  = (moe_matvec_f32_fn)  ggml_backend_reg_get_proc_address(reg, "ggml_moe_matvec_f32");
 }
 
 #define MOE_PREDICT_HOOK(fn)   do { if (g_fn_predict) g_fn_predict((fn)); } while (0)
@@ -345,6 +348,11 @@ static uint64_t g_pool_hits = 0, g_pool_cold = 0;
 
 static uint64_t g_fetch_us = 0;   // cumulative wall time in pool_fill() memcpy
 static uint64_t g_steps = 0;      // update() calls (= graph computes)
+static uint64_t g_decode_steps = 0;
+static uint64_t g_decode_fetch_us = 0;
+static moe_timing_snapshot g_decode_timing;
+static moe_timing_snapshot g_last_step_timing;
+static uint64_t g_last_step_fetch_us = 0;
 static uint64_t g_timing_interval = 0; // LLAMA_EXPERT_TIMING: updates between logs
 static FILE *   g_route_log = nullptr; // actual-routing trace (co-opened with pred log)
 
@@ -358,21 +366,24 @@ static std::atomic<uint64_t> g_trace_pool_fill_us{0};
 static std::atomic<uint64_t> g_trace_pool_fill_bytes{0};
 static std::atomic<uint64_t> g_trace_pool_fills{0};
 
-// pre-gate predictor: immutable CPU mirrors of each MoE layer's router and
-// ffn norm weights. The fused cold op reports its router input x through the
-// predict hook; running physical layer L+4's router on layer L's x (with its
-// norm reconstructed as w_target * (x / w_cur)) predicts that exact layer's
-// experts four layers ahead of demand. No learned parameters: the predictor
-// is the model's own gating function applied early.
+// pre-gate predictor: immutable CPU mirrors of each MoE layer's effective
+// router. At initialization the target router is fused with the source/target
+// norm ratio. At runtime the fused cold op reports its router input x through
+// the predict hook, so predicting physical layer L+4 needs only one matrix-
+// vector product. No learned parameters: the predictor is the model's own
+// gating function applied early.
 static constexpr int PREGATE_LOOKAHEAD = 4;
 
 struct pred_layer {
     int il = -1;
     int target_ix = -1;
     int n_routed = 0;
+    int64_t ne0 = 0;
+    int64_t n_exp = 0;
     float historical_cold_rate = 1.0f;
     std::vector<float> norm;
     std::vector<float> gate;
+    std::vector<float> effective_gate;
 };
 
 static std::vector<pred_layer> g_pred;
@@ -449,9 +460,17 @@ static std::condition_variable g_work_cv;
 static std::deque<std::shared_ptr<prediction_ticket>> g_prediction_q;
 static std::vector<std::shared_ptr<prediction_ticket>> g_ticket_by_layer;
 static std::thread g_prediction_worker;
+static std::atomic<bool> g_pred_shutdown_done{false};
 static std::atomic<uint64_t> g_prediction_id{0};
 static std::atomic<uint64_t> g_prediction_late{0};
 static std::atomic<uint64_t> g_prediction_canceled{0};
+static bool g_prediction_stage_timing = false;
+static bool g_prediction_native_matvec = false;
+static std::atomic<uint64_t> g_prediction_prepare_us{0};
+static std::atomic<uint64_t> g_prediction_matvec_us{0};
+static std::atomic<uint64_t> g_prediction_softmax_entropy_us{0};
+static std::atomic<uint64_t> g_prediction_rank_select_us{0};
+static std::atomic<uint64_t> g_prediction_residency_enqueue_us{0};
 static std::atomic<uint64_t> g_hot_pins{0};
 static std::atomic<uint64_t> g_hot_unpins{0};
 static std::atomic<uint64_t> g_prefetch_promotions{0};
@@ -488,6 +507,34 @@ static std::vector<uint64_t> g_wait_samples_us;
 static std::vector<uint64_t> g_cancel_response_samples_us;
 static std::vector<uint64_t> g_prediction_queue_samples_us;
 static std::vector<uint64_t> g_prediction_compute_samples_us;
+
+struct gpu_prediction_layer {
+    ggml_tensor * gate = nullptr;
+    ggml_tensor * x = nullptr;
+    ggml_tensor * logits = nullptr;
+    ggml_cgraph * graph = nullptr;
+};
+
+static bool g_gpu_prediction_shadow_requested = false;
+static bool g_gpu_prediction_shadow_initialized = false;
+static std::atomic<bool> g_gpu_prediction_shadow_enabled{false};
+static ggml_backend_t g_gpu_prediction_backend = nullptr;
+static ggml_backend_dev_t g_gpu_prediction_device = nullptr;
+static ggml_backend_buffer_t g_gpu_prediction_buffer = nullptr;
+static ggml_backend_event_t g_gpu_prediction_event = nullptr;
+static ggml_context * g_gpu_prediction_ctx = nullptr;
+static std::vector<gpu_prediction_layer> g_gpu_prediction_layers;
+static std::mutex g_gpu_prediction_mu;
+static std::condition_variable g_gpu_prediction_cv;
+static std::deque<std::shared_ptr<prediction_ticket>> g_gpu_prediction_q;
+static std::thread g_gpu_prediction_worker;
+static std::atomic<uint64_t> g_gpu_prediction_submitted{0};
+static std::atomic<uint64_t> g_gpu_prediction_completed{0};
+static std::atomic<uint64_t> g_gpu_prediction_dropped_canceled{0};
+static std::atomic<uint64_t> g_gpu_prediction_dropped_queue{0};
+static std::atomic<uint64_t> g_gpu_prediction_failures{0};
+static std::vector<uint64_t> g_gpu_prediction_roundtrip_samples_us;
+static size_t g_gpu_predictor_mirror_bytes = 0;
 
 static void note_demand_start();
 static void note_demand_end();
@@ -1188,20 +1235,130 @@ static void prefetch_worker() {
     }
 }
 
+static void gpu_prediction_shadow_worker() {
+    std::vector<float> logits;
+    int consecutive_failures = 0;
+    std::unique_lock<std::mutex> lk(g_gpu_prediction_mu);
+    for (;;) {
+        g_gpu_prediction_cv.wait(lk, [] {
+            return g_work_exit.load(std::memory_order_acquire) ||
+                    (g_gpu_prediction_shadow_enabled.load(std::memory_order_acquire) && !g_gpu_prediction_q.empty());
+        });
+        if (g_work_exit.load(std::memory_order_acquire)) {
+            return;
+        }
+        auto ticket = g_gpu_prediction_q.front();
+        g_gpu_prediction_q.pop_front();
+        lk.unlock();
+
+        if (ticket->cancel.load(std::memory_order_acquire) ||
+                ticket->source_pi < 0 || ticket->source_pi >= (int) g_gpu_prediction_layers.size()) {
+            g_gpu_prediction_dropped_canceled.fetch_add(1, std::memory_order_relaxed);
+            lk.lock();
+            continue;
+        }
+        gpu_prediction_layer & layer = g_gpu_prediction_layers[(size_t) ticket->source_pi];
+        if (!layer.graph || !layer.x || !layer.logits ||
+                ticket->x.size() != (size_t) layer.x->ne[0]) {
+            g_gpu_prediction_dropped_canceled.fetch_add(1, std::memory_order_relaxed);
+            lk.lock();
+            continue;
+        }
+
+        logits.resize((size_t) layer.logits->ne[0]);
+        const uint64_t start_us = (uint64_t) ggml_time_us();
+        ggml_backend_tensor_set_async(g_gpu_prediction_backend, layer.x,
+                ticket->x.data(), 0, ticket->x.size()*sizeof(float));
+        const ggml_status status = ggml_backend_graph_compute_async(g_gpu_prediction_backend, layer.graph);
+        if (status != GGML_STATUS_SUCCESS) {
+            g_gpu_prediction_failures.fetch_add(1, std::memory_order_relaxed);
+            consecutive_failures++;
+            if (consecutive_failures >= 3) {
+                g_gpu_prediction_shadow_enabled.store(false, std::memory_order_release);
+                lk.lock();
+                g_gpu_prediction_dropped_queue.fetch_add(g_gpu_prediction_q.size(), std::memory_order_relaxed);
+                g_gpu_prediction_q.clear();
+                continue;
+            }
+            lk.lock();
+            continue;
+        }
+        ggml_backend_tensor_get_async(g_gpu_prediction_backend, layer.logits,
+                logits.data(), 0, logits.size()*sizeof(float));
+        ggml_backend_event_record(g_gpu_prediction_event, g_gpu_prediction_backend);
+        ggml_backend_event_synchronize(g_gpu_prediction_event);
+        const uint64_t end_us = (uint64_t) ggml_time_us();
+        record_metric_sample(g_gpu_prediction_roundtrip_samples_us, end_us - start_us);
+        g_gpu_prediction_completed.fetch_add(1, std::memory_order_relaxed);
+        consecutive_failures = 0;
+        lk.lock();
+    }
+}
+
+static void enqueue_gpu_prediction_shadow(const std::shared_ptr<prediction_ticket> & ticket) {
+    if (!g_gpu_prediction_shadow_enabled.load(std::memory_order_acquire)) {
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_gpu_prediction_mu);
+        static constexpr size_t GPU_PREDICTION_QUEUE_LIMIT = 8;
+        if (g_gpu_prediction_q.size() >= GPU_PREDICTION_QUEUE_LIMIT) {
+            g_gpu_prediction_q.pop_front();
+            g_gpu_prediction_dropped_queue.fetch_add(1, std::memory_order_relaxed);
+        }
+        g_gpu_prediction_q.push_back(ticket);
+        g_gpu_prediction_submitted.fetch_add(1, std::memory_order_relaxed);
+    }
+    g_gpu_prediction_cv.notify_one();
+}
+
 static void pred_shutdown() {
-    if (!g_workers.empty() || g_prediction_worker.joinable()) {
+    const bool has_resources = !g_workers.empty() || g_prediction_worker.joinable() ||
+            g_gpu_prediction_worker.joinable() || g_gpu_prediction_backend ||
+            g_gpu_prediction_event || g_gpu_prediction_buffer || g_gpu_prediction_ctx;
+    if (!has_resources) {
+        return;
+    }
+    bool expected = false;
+    if (!g_pred_shutdown_done.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+        return;
+    }
+    if (!g_workers.empty() || g_prediction_worker.joinable() || g_gpu_prediction_worker.joinable()) {
         {
             std::lock_guard<std::mutex> lk(g_work_mu);
             g_work_exit = true;
         }
         g_work_cv.notify_all();
         g_prediction_cv.notify_all();
+        g_gpu_prediction_cv.notify_all();
         if (g_prediction_worker.joinable()) {
             g_prediction_worker.join();
+        }
+        if (g_gpu_prediction_worker.joinable()) {
+            g_gpu_prediction_worker.join();
         }
         for (auto & t : g_workers) {
             t.join();
         }
+    }
+    if (g_gpu_prediction_backend) {
+        ggml_backend_synchronize(g_gpu_prediction_backend);
+    }
+    if (g_gpu_prediction_event) {
+        ggml_backend_event_free(g_gpu_prediction_event);
+        g_gpu_prediction_event = nullptr;
+    }
+    if (g_gpu_prediction_buffer) {
+        ggml_backend_buffer_free(g_gpu_prediction_buffer);
+        g_gpu_prediction_buffer = nullptr;
+    }
+    if (g_gpu_prediction_ctx) {
+        ggml_free(g_gpu_prediction_ctx);
+        g_gpu_prediction_ctx = nullptr;
+    }
+    if (g_gpu_prediction_backend) {
+        ggml_backend_free(g_gpu_prediction_backend);
+        g_gpu_prediction_backend = nullptr;
     }
 }
 
@@ -1209,39 +1366,57 @@ static bool ticket_actual_contains(const prediction_ticket & ticket, int e) {
     return std::find(ticket.actual.begin(), ticket.actual.end(), e) != ticket.actual.end();
 }
 
+struct prediction_scratch {
+    std::vector<float> logits;
+    std::vector<float> probabilities;
+    std::vector<int32_t> idx;
+};
+
 static void compute_prediction(const std::shared_ptr<prediction_ticket> & ticket) {
     ticket->compute_start_us = (uint64_t) ggml_time_us();
     const pred_layer & cur = g_pred[ticket->source_pi];
-    const pred_layer & target = g_pred[ticket->target_pi];
     const int64_t ne0 = (int64_t) ticket->x.size();
-    if ((int64_t) cur.norm.size() != ne0 || (int64_t) target.norm.size() != ne0 || ne0 == 0) {
+    if (ne0 == 0 || cur.effective_gate.empty() || cur.effective_gate.size() % (size_t) ne0 != 0) {
         ticket->cancel.store(true, std::memory_order_release);
         return;
     }
-    const int64_t n_exp = (int64_t) (target.gate.size()/ne0);
-    std::vector<float> hv((size_t) ne0);
-    std::vector<float> logits((size_t) n_exp);
-    std::vector<float> probabilities((size_t) n_exp);
-    std::vector<int32_t> idx((size_t) n_exp);
-    for (int64_t i = 0; i < ne0; i++) {
-        const float w = cur.norm[(size_t) i];
-        hv[(size_t) i] = target.norm[(size_t) i]*(w*w > 1e-12f ? ticket->x[(size_t) i]/w : 0.0f);
-    }
+    const int64_t n_exp = (int64_t) (cur.effective_gate.size()/(size_t) ne0);
+    static thread_local prediction_scratch scratch;
+    scratch.logits.resize((size_t) n_exp);
+    scratch.probabilities.resize((size_t) n_exp);
+    scratch.idx.resize((size_t) n_exp);
+    std::vector<float> & logits = scratch.logits;
+    std::vector<float> & probabilities = scratch.probabilities;
+    std::vector<int32_t> & idx = scratch.idx;
+    const uint64_t matvec_start_us = g_prediction_stage_timing ? (uint64_t) ggml_time_us() : 0;
     float max_logit = -FLT_MAX;
-    for (int64_t e = 0; e < n_exp; e++) {
-        if (ticket->cancel.load(std::memory_order_acquire)) {
-            g_prediction_canceled.fetch_add(1, std::memory_order_relaxed);
-            return;
-        }
-        const float * gate = target.gate.data() + (size_t) e*ne0;
-        float score = 0.0f;
-        for (int64_t i = 0; i < ne0; i++) {
-            score += gate[i]*hv[(size_t) i];
-        }
-        logits[(size_t) e] = score;
-        max_logit = std::max(max_logit, score);
-        idx[(size_t) e] = (int32_t) e;
+    if (ticket->cancel.load(std::memory_order_acquire)) {
+        g_prediction_canceled.fetch_add(1, std::memory_order_relaxed);
+        return;
     }
+    if (g_prediction_native_matvec && g_fn_matvec) {
+        g_fn_matvec(cur.effective_gate.data(), ticket->x.data(), logits.data(), n_exp, ne0);
+        for (int64_t e = 0; e < n_exp; ++e) {
+            max_logit = std::max(max_logit, logits[(size_t) e]);
+            idx[(size_t) e] = (int32_t) e;
+        }
+    } else {
+        for (int64_t e = 0; e < n_exp; e++) {
+            if (ticket->cancel.load(std::memory_order_acquire)) {
+                g_prediction_canceled.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+            const float * gate = cur.effective_gate.data() + (size_t) e*ne0;
+            float score = 0.0f;
+            for (int64_t i = 0; i < ne0; i++) {
+                score += gate[i]*ticket->x[(size_t) i];
+            }
+            logits[(size_t) e] = score;
+            max_logit = std::max(max_logit, score);
+            idx[(size_t) e] = (int32_t) e;
+        }
+    }
+    const uint64_t matvec_end_us = g_prediction_stage_timing ? (uint64_t) ggml_time_us() : 0;
     double sum = 0.0;
     for (int64_t e = 0; e < n_exp; e++) {
         const float p = std::exp(logits[(size_t) e] - max_logit);
@@ -1256,6 +1431,7 @@ static void compute_prediction(const std::shared_ptr<prediction_ticket> & ticket
         }
     }
     const float normalized_entropy = n_exp > 1 ? (float) (entropy/std::log((double) n_exp)) : 0.0f;
+    const uint64_t softmax_entropy_end_us = g_prediction_stage_timing ? (uint64_t) ggml_time_us() : 0;
     const int top_n = std::min((int) n_exp, g_prefetch_max);
     std::partial_sort(idx.begin(), idx.begin() + top_n, idx.end(),
             [&](int32_t a, int32_t b) { return logits[(size_t) a] > logits[(size_t) b]; });
@@ -1263,6 +1439,9 @@ static void compute_prediction(const std::shared_ptr<prediction_ticket> & ticket
     std::vector<int32_t> selected;
     std::vector<int32_t> top_experts;
     std::vector<float> top_probabilities;
+    selected.reserve((size_t) top_n);
+    top_experts.reserve((size_t) top_n);
+    top_probabilities.reserve((size_t) top_n);
     if (top_n > 0) {
         selected.push_back(idx[0]);
     }
@@ -1279,6 +1458,12 @@ static void compute_prediction(const std::shared_ptr<prediction_ticket> & ticket
         }
     }
     ticket->compute_end_us = (uint64_t) ggml_time_us();
+    if (g_prediction_stage_timing) {
+        g_prediction_prepare_us.fetch_add(matvec_start_us - ticket->compute_start_us, std::memory_order_relaxed);
+        g_prediction_matvec_us.fetch_add(matvec_end_us - matvec_start_us, std::memory_order_relaxed);
+        g_prediction_softmax_entropy_us.fetch_add(softmax_entropy_end_us - matvec_end_us, std::memory_order_relaxed);
+        g_prediction_rank_select_us.fetch_add(ticket->compute_end_us - softmax_entropy_end_us, std::memory_order_relaxed);
+    }
 
     std::lock_guard<std::mutex> lk(ticket->mu);
     if (ticket->cancel.load(std::memory_order_acquire) || ticket->actual_known) {
@@ -1311,6 +1496,10 @@ static void compute_prediction(const std::shared_ptr<prediction_ticket> & ticket
     }
     ticket->prediction_done = true;
     g_pred_pushes++;
+    if (g_prediction_stage_timing) {
+        g_prediction_residency_enqueue_us.fetch_add(
+                (uint64_t) ggml_time_us() - ticket->compute_end_us, std::memory_order_relaxed);
+    }
 }
 
 static void prediction_worker() {
@@ -1372,6 +1561,7 @@ static void pregate_hook(const ggml_tensor * counts, const ggml_tensor * x) {
         g_ticket_by_layer[(size_t) ticket->target_layer] = ticket;
         g_prediction_q.push_back(ticket);
     }
+    enqueue_gpu_prediction_shadow(ticket);
     g_prediction_cv.notify_one();
 }
 
@@ -1558,12 +1748,111 @@ static void pregate_predict_match(const ggml_tensor * counts, const ggml_tensor 
     }
 }
 
+static bool gpu_prediction_shadow_init() {
+    if (!g_gpu_prediction_shadow_requested || g_pred_pairs == 0) {
+        return false;
+    }
+
+    for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+        ggml_backend_dev_t device = ggml_backend_dev_get(i);
+        ggml_backend_reg_t reg = device ? ggml_backend_dev_backend_reg(device) : nullptr;
+        const char * reg_name = reg ? ggml_backend_reg_name(reg) : nullptr;
+        if (reg_name && strcmp(reg_name, "Vulkan") == 0) {
+            g_gpu_prediction_device = device;
+            break;
+        }
+    }
+    if (!g_gpu_prediction_device) {
+        TIER_LOG("%s: Vulkan device unavailable; keeping CPU predictor\n", __func__);
+        return false;
+    }
+
+    g_gpu_prediction_backend = ggml_backend_dev_init(g_gpu_prediction_device, "queue=auxiliary");
+    if (!g_gpu_prediction_backend) {
+        TIER_LOG("%s: independent Vulkan compute queue unavailable; keeping CPU predictor\n", __func__);
+        return false;
+    }
+
+    const size_t graph_size = 16;
+    const size_t metadata_bytes = 1024*1024 + g_pred_pairs*(
+            3*ggml_tensor_overhead() + ggml_graph_overhead_custom(graph_size, false));
+    ggml_init_params params = {
+        /* .mem_size   = */ metadata_bytes,
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    g_gpu_prediction_ctx = ggml_init(params);
+    if (!g_gpu_prediction_ctx) {
+        ggml_backend_free(g_gpu_prediction_backend);
+        g_gpu_prediction_backend = nullptr;
+        TIER_LOG("%s: Vulkan predictor metadata allocation failed; keeping CPU predictor\n", __func__);
+        return false;
+    }
+
+    g_gpu_prediction_layers.resize(g_pred.size());
+    for (size_t pi = 0; pi < g_pred.size(); pi++) {
+        const pred_layer & source = g_pred[pi];
+        if (source.target_ix < 0 || source.ne0 <= 0 || source.effective_gate.empty()) {
+            continue;
+        }
+        const int64_t n_exp = (int64_t) (source.effective_gate.size()/(size_t) source.ne0);
+        gpu_prediction_layer & layer = g_gpu_prediction_layers[pi];
+        layer.gate = ggml_new_tensor_2d(g_gpu_prediction_ctx, GGML_TYPE_F32, source.ne0, n_exp);
+        layer.x = ggml_new_tensor_1d(g_gpu_prediction_ctx, GGML_TYPE_F32, source.ne0);
+        layer.logits = ggml_mul_mat(g_gpu_prediction_ctx, layer.gate, layer.x);
+        layer.graph = ggml_new_graph_custom(g_gpu_prediction_ctx, graph_size, false);
+        ggml_build_forward_expand(layer.graph, layer.logits);
+    }
+
+    g_gpu_prediction_buffer = ggml_backend_alloc_ctx_tensors(g_gpu_prediction_ctx, g_gpu_prediction_backend);
+    if (!g_gpu_prediction_buffer) {
+        ggml_free(g_gpu_prediction_ctx);
+        g_gpu_prediction_ctx = nullptr;
+        ggml_backend_free(g_gpu_prediction_backend);
+        g_gpu_prediction_backend = nullptr;
+        g_gpu_prediction_layers.clear();
+        TIER_LOG("%s: Vulkan predictor tensor allocation failed; keeping CPU predictor\n", __func__);
+        return false;
+    }
+    for (size_t pi = 0; pi < g_pred.size(); pi++) {
+        const pred_layer & source = g_pred[pi];
+        if (!g_gpu_prediction_layers[pi].gate) {
+            continue;
+        }
+        ggml_backend_tensor_set_async(g_gpu_prediction_backend, g_gpu_prediction_layers[pi].gate,
+                source.effective_gate.data(), 0, source.effective_gate.size()*sizeof(float));
+        g_gpu_predictor_mirror_bytes += source.effective_gate.size()*sizeof(float);
+    }
+    ggml_backend_synchronize(g_gpu_prediction_backend);
+
+    g_gpu_prediction_event = ggml_backend_event_new(g_gpu_prediction_device);
+    if (!g_gpu_prediction_event) {
+        ggml_backend_buffer_free(g_gpu_prediction_buffer);
+        g_gpu_prediction_buffer = nullptr;
+        ggml_free(g_gpu_prediction_ctx);
+        g_gpu_prediction_ctx = nullptr;
+        ggml_backend_free(g_gpu_prediction_backend);
+        g_gpu_prediction_backend = nullptr;
+        g_gpu_prediction_layers.clear();
+        g_gpu_predictor_mirror_bytes = 0;
+        TIER_LOG("%s: Vulkan predictor event creation failed; keeping CPU predictor\n", __func__);
+        return false;
+    }
+
+    g_gpu_prediction_shadow_initialized = true;
+    g_gpu_prediction_shadow_enabled.store(true, std::memory_order_release);
+    g_gpu_prediction_worker = std::thread(gpu_prediction_shadow_worker);
+    TIER_LOG("%s: shadow Vulkan predictor on %s, %.1f MiB mirrors, independent compute queue\n",
+            __func__, ggml_backend_dev_description(g_gpu_prediction_device),
+            (double) g_gpu_predictor_mirror_bytes/(1024.0*1024.0));
+    return true;
+}
+
 static void pred_init(const llama_model & model) {
     if (!g_predict) {
         return;
     }
     const int n_layer = model.hparams.n_layer();
-    std::vector<float> raw;
     size_t mirror_bytes = 0;
     for (int il = 0; il < n_layer; il++) {
         if (g_layers[il].ws.empty() || !g_layers[il].sd) {
@@ -1587,6 +1876,8 @@ static void pred_init(const llama_model & model) {
         pred_layer pl;
         pl.il = il;
         pl.n_routed = model.hparams.n_expert_used;
+        pl.ne0 = ne0;
+        pl.n_exp = n_exp;
         uint64_t historical_total = 0;
         uint64_t historical_cold = 0;
         for (int e = 0; e < g_layers[il].n_expert; e++) {
@@ -1604,7 +1895,6 @@ static void pred_init(const llama_model & model) {
         ggml_backend_tensor_get(gate, pl.gate.data(), 0, (size_t) n_exp*ne0*sizeof(float));
         g_pred_ix[g_layers[il].sd->counts->data] = (int) g_pred.size();
         g_pred.push_back(std::move(pl));
-        mirror_bytes += (size_t) (n_exp + 1)*ne0*sizeof(float);
     }
     std::vector<int> pred_ix_by_layer(n_layer, -1);
     for (int pi = 0; pi < (int) g_pred.size(); pi++) {
@@ -1614,13 +1904,46 @@ static void pred_init(const llama_model & model) {
         const int target_il = source.il + PREGATE_LOOKAHEAD;
         if (target_il < n_layer && pred_ix_by_layer[target_il] >= 0) {
             source.target_ix = pred_ix_by_layer[target_il];
+            const pred_layer & target = g_pred[source.target_ix];
+            if (source.norm.size() != target.norm.size() || source.norm.empty()) {
+                source.target_ix = -1;
+                continue;
+            }
+            const size_t ne0 = source.norm.size();
+            const size_t n_exp = target.gate.size()/ne0;
+            if (n_exp == 0 || n_exp*ne0 != target.gate.size()) {
+                source.target_ix = -1;
+                continue;
+            }
+            source.effective_gate.resize(target.gate.size());
+            std::vector<float> scale(ne0);
+            for (size_t i = 0; i < ne0; i++) {
+                const float current_norm = source.norm[i];
+                scale[i] = current_norm*current_norm > 1e-12f ? target.norm[i]/current_norm : 0.0f;
+            }
+            for (size_t e = 0; e < n_exp; e++) {
+                for (size_t i = 0; i < ne0; i++) {
+                    const size_t index = e*ne0 + i;
+                    source.effective_gate[index] = target.gate[index]*scale[i];
+                }
+            }
+            mirror_bytes += source.effective_gate.size()*sizeof(float);
             g_pred_pairs++;
         }
+    }
+    for (pred_layer & layer : g_pred) {
+        layer.norm.clear();
+        layer.norm.shrink_to_fit();
+        layer.gate.clear();
+        layer.gate.shrink_to_fit();
     }
     const bool want_worker = g_predict && !g_prefetch_calibrate && g_poolB_alloc > 0 && g_pred_pairs > 0;
     g_predictor_mirror_bytes = mirror_bytes;
     const bool want_predictor = g_predict && g_pred_pairs > 0 &&
             (g_pred_log || want_worker || g_prefetch_calibrate || getenv("LLAMA_EXPERT_STATS") != nullptr);
+    if (want_predictor) {
+        gpu_prediction_shadow_init();
+    }
     if (want_predictor) {
         g_ticket_by_layer.resize((size_t) model.hparams.n_layer());
         tier_resolve_moe_hooks();
@@ -2073,6 +2396,27 @@ static void dump_stats() {
                         (unsigned long long) g_residency_enqueued.load(std::memory_order_relaxed),
                         (unsigned long long) g_prefetch_copy_us.load(std::memory_order_relaxed),
                         (unsigned long long) g_prediction_skipped_low_cold.load(std::memory_order_relaxed));
+                fprintf(f, "expert_prediction_stages: enabled %d prepare_us %llu matvec_us %llu softmax_entropy_us %llu rank_select_us %llu residency_enqueue_us %llu\n",
+                        g_prediction_stage_timing ? 1 : 0,
+                        (unsigned long long) g_prediction_prepare_us.load(std::memory_order_relaxed),
+                        (unsigned long long) g_prediction_matvec_us.load(std::memory_order_relaxed),
+                        (unsigned long long) g_prediction_softmax_entropy_us.load(std::memory_order_relaxed),
+                        (unsigned long long) g_prediction_rank_select_us.load(std::memory_order_relaxed),
+                        (unsigned long long) g_prediction_residency_enqueue_us.load(std::memory_order_relaxed));
+                fprintf(f, "expert_predictor_matvec: mode %s native_available %d\n",
+                        g_prediction_native_matvec ? "native" : "scalar", g_fn_matvec ? 1 : 0);
+                fprintf(f, "expert_gpu_predictor_shadow: initialized %d enabled %d submitted %llu completed %llu dropped_canceled %llu dropped_queue %llu failures %llu roundtrip_us %llu p50_us %llu p95_us %llu p99_us %llu\n",
+                        g_gpu_prediction_shadow_initialized ? 1 : 0,
+                        g_gpu_prediction_shadow_enabled.load(std::memory_order_relaxed) ? 1 : 0,
+                        (unsigned long long) g_gpu_prediction_submitted.load(std::memory_order_relaxed),
+                        (unsigned long long) g_gpu_prediction_completed.load(std::memory_order_relaxed),
+                        (unsigned long long) g_gpu_prediction_dropped_canceled.load(std::memory_order_relaxed),
+                        (unsigned long long) g_gpu_prediction_dropped_queue.load(std::memory_order_relaxed),
+                        (unsigned long long) g_gpu_prediction_failures.load(std::memory_order_relaxed),
+                        (unsigned long long) metric_sum(g_gpu_prediction_roundtrip_samples_us),
+                        (unsigned long long) metric_percentile(g_gpu_prediction_roundtrip_samples_us, 0.50),
+                        (unsigned long long) metric_percentile(g_gpu_prediction_roundtrip_samples_us, 0.95),
+                        (unsigned long long) metric_percentile(g_gpu_prediction_roundtrip_samples_us, 0.99));
                 for (int rank = 0; rank < std::min(g_prefetch_max, PREFETCH_RANK_STATS); rank++) {
                     fprintf(f, "expert_prediction_rank %d: selected %llu used %llu enqueued %llu correct_bytes %llu wrong_bytes %llu\n",
                             rank + 1,
@@ -2114,9 +2458,9 @@ static void dump_stats() {
                         (unsigned long long) g_prediction_late.load(std::memory_order_relaxed),
                         (unsigned long long) g_prediction_canceled.load(std::memory_order_relaxed));
             }
-            fprintf(f, "expert_memory_bytes: model_mmap %zu hot_backend %zu demand_pool %zu prefetch_pool %zu pread_ring %zu predictor_mirror %zu\n",
+            fprintf(f, "expert_memory_bytes: model_mmap %zu hot_backend %zu demand_pool %zu prefetch_pool %zu pread_ring %zu predictor_mirror %zu gpu_predictor_mirror %zu\n",
                     g_model_mmap_bytes, g_hot_alloc, g_pool_alloc, g_poolB_alloc,
-                    g_stage_alloc, g_predictor_mirror_bytes);
+                    g_stage_alloc, g_predictor_mirror_bytes, g_gpu_predictor_mirror_bytes);
             fprintf(f, "expert_initialization_us: total %llu hot_fill %llu demand_pool_fill %llu\n",
                     (unsigned long long) g_init_total_us,
                     (unsigned long long) g_init_hot_fill_us,
@@ -2144,6 +2488,18 @@ static void dump_stats() {
                         (unsigned long long) timing.gate_up,
                         (unsigned long long) timing.activation,
                         (unsigned long long) down_tail);
+                const uint64_t decode_down_tail = g_decode_timing.total >
+                        g_decode_timing.setup + g_decode_timing.gate_up + g_decode_timing.activation
+                    ? g_decode_timing.total - g_decode_timing.setup -
+                        g_decode_timing.gate_up - g_decode_timing.activation : 0;
+                fprintf(f, "expert_decode_timers: steps %llu pool_fill_us %llu cold_total_us %llu setup_us %llu gate_up_us %llu activation_us %llu down_and_sync_us %llu\n",
+                        (unsigned long long) g_decode_steps,
+                        (unsigned long long) g_decode_fetch_us,
+                        (unsigned long long) g_decode_timing.total,
+                        (unsigned long long) g_decode_timing.setup,
+                        (unsigned long long) g_decode_timing.gate_up,
+                        (unsigned long long) g_decode_timing.activation,
+                        (unsigned long long) decode_down_tail);
             }
             for (const auto & L : g_layers) {
                 if (L.ws.empty() || L.cum_total == 0) {
@@ -2231,7 +2587,7 @@ static void dump_stats() {
     }
 }
 
-void update() {
+void update(int64_t n_tokens) {
     std::vector<std::shared_ptr<prediction_ticket>> finished;
     {
         std::lock_guard<std::mutex> lk(g_prediction_mu);
@@ -2260,6 +2616,17 @@ void update() {
         g_pool_fill_budget = 16 << 20;
         maybe_update(L);
     }
+    const moe_timing_snapshot step_timing = moe_timing_snapshot_get();
+    if (n_tokens == 1) {
+        g_decode_steps++;
+        g_decode_fetch_us += g_fetch_us - g_last_step_fetch_us;
+        g_decode_timing.total += step_timing.total - g_last_step_timing.total;
+        g_decode_timing.setup += step_timing.setup - g_last_step_timing.setup;
+        g_decode_timing.gate_up += step_timing.gate_up - g_last_step_timing.gate_up;
+        g_decode_timing.activation += step_timing.activation - g_last_step_timing.activation;
+    }
+    g_last_step_fetch_us = g_fetch_us;
+    g_last_step_timing = step_timing;
     if (g_timing_interval && g_steps % g_timing_interval == 0) {
         const moe_timing_snapshot timing = moe_timing_snapshot_get();
         const uint64_t down_tail = timing.total > timing.setup + timing.gate_up + timing.activation
@@ -2278,6 +2645,10 @@ void set_perf_trace(bool enabled) {
         tier_resolve_moe_hooks();
         LLAMA_LOG_INFO("[PERF_TRACE] expert tier tracing enabled\n");
     }
+}
+
+void shutdown() {
+    pred_shutdown();
 }
 
 void perf_trace_begin() {
@@ -2373,6 +2744,15 @@ void init(const llama_model & model) {
     }
     if (const char * e = getenv("LLAMA_EXPERT_PREDICT")) {
         g_predict = atoi(e) != 0;
+    }
+    if (const char * e = getenv("LLAMA_EXPERT_PREDICT_STAGE_TIMING")) {
+        g_prediction_stage_timing = atoi(e) != 0;
+    }
+    if (const char * e = getenv("LLAMA_EXPERT_PREDICT_MATVEC")) {
+        g_prediction_native_matvec = strcmp(e, "scalar") != 0;
+    }
+    if (const char * e = getenv("LLAMA_EXPERT_GPU_PREDICT")) {
+        g_gpu_prediction_shadow_requested = strcmp(e, "shadow") == 0;
     }
     // Calibration is itself a request to run the predictor. It suppresses
     // physical prefetch below, so it is safe even without the environment flag.

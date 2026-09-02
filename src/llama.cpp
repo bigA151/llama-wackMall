@@ -140,6 +140,7 @@ void llama_numa_init(enum ggml_numa_strategy numa) {
 }
 
 void llama_backend_free(void) {
+    llama_expert_tier::shutdown();
     ggml_quantize_free();
 }
 
@@ -604,4 +605,3 @@ const char * llama_print_system_info(void) {
 
     return s.c_str();
 }
-

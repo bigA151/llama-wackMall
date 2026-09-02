@@ -49,8 +49,8 @@ Replaces layer-granular offload with **expert-granular offload**:
 3. **Demand RAM pool.** Intermediate cache tier one level below VRAM.
    Fills/evicts follow score + hysteresis in the update() window. ptrs tables
    let cold ops read from pool or mmap transparently. Env: LLAMA_EXPERT_RAMPOOL.
-4. **Pre-gated predictive prefetch.** Runs the next layer's router one step
-   early on the current hidden state. Predicted experts are prefetched into
+4. **Pre-gated predictive prefetch.** Runs physical layer L+4's router four
+   layers early on layer L's hidden state. Predicted experts are prefetched into
    a speculative pool by worker threads during compute. Env: LLAMA_EXPERT_PREDICT,
    LLAMA_EXPERT_PREFETCH_GB.
 5. **Adaptive online cache.** Router decisions are counted per token; an
@@ -197,9 +197,39 @@ The equivalent environment switch is `LLAMA_ARG_PERF_TRACE=1`.
 | `LLAMA_EXPERT_PREFETCH_GB` | 0 | Speculative pool (GiB). 0 = off |
 | `LLAMA_EXPERT_PREFETCH_THREADS` | 2 | Prefetch worker threads (1..8) |
 | `LLAMA_EXPERT_PREFETCH_MB` | 64 | In-flight prefetch bytes cap (MiB) |
+| `LLAMA_EXPERT_PREFETCH_ENTROPY` | - | Normalized-entropy threshold for selecting beyond top-1 |
+| `LLAMA_EXPERT_PREFETCH_PROBABILITY` | - | Minimum router probability for ranks 2..N |
+| `LLAMA_EXPERT_PREFETCH_MIN_COLD_RATE` | 0 | Skip prediction for target layers below this historical cold-route fraction |
 | `LLAMA_EXPERT_PREDICT_LOG` | - | Path: dump prediction trace (debug) |
+| `LLAMA_EXPERT_PREFETCH_LOG` | - | Path: dump decode expert prefetch coverage (`token,layer,expert,predicted,cold,demand_cached,ready_at_need`) |
 | `LLAMA_EXPERT_STATS` | - | 1 or path: dump stats at exit |
 | `LLAMA_EXPERT_USAGE` | - | Path: dump counts (reusable as seed) |
+
+When `LLAMA_EXPERT_STATS` is enabled, the exit report includes expert-level
+decode metrics: `expert_prefetch_timeliness` measures whether correctly
+predicted experts that still required a move were ready when the cold op began;
+`expert_prefetch_coverage` reports prefetched selections over all routed and
+over cold routed selections. Per-token and per-layer hit rates are emitted as
+`expert_prefetch_token` and `expert_prefetch_layer`. Set
+`LLAMA_EXPERT_PREFETCH_LOG` for the underlying expert-level CSV.
+
+The current decode-only predictor is submitted asynchronously when FFN
+gate/up begins and targets physical layer L+4. Selection always includes
+top-1; when both confidence thresholds are configured and normalized entropy
+is low enough, ranks 2..N are added while their probability exceeds the
+configured threshold. Use `--expert-prefetch-max` (default 3),
+`--expert-prefetch-slots` (explicit slots per layer), and
+`--expert-prefetch-chunk-mb` (default 4 MiB) to control the physical pool.
+Calibration mode (`--expert-prefetch-calibrate`) records predictions without
+performing physical prefetch.
+
+On Windows, `scripts/run-prefetch-validation.ps1` restores a byte-identical
+`.tier` sidecar before every run. Use `-TraceMode Diagnostic` for I/O and wait
+percentiles, then `-TraceMode Throughput` for final throughput. Cold-cache
+runs require an elevated PowerShell because RAMMap empties the Standby List.
+`scripts/run-prefetch-sweep.ps1` screens the agreed entropy thresholds against
+2/4/8 workers; `scripts/check-prefetch-validation.ps1` checks prediction JSON,
+slot invariants, hot-lock lifetime, L+4 targeting, and deterministic output.
 
 ### Large-prefill experiment
 

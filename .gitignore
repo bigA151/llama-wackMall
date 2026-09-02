@@ -21,6 +21,22 @@
 *.swp
 *.tmp
 *.DS_Store
+*.txt
+*.json
+*.py
+*.tier
+*.jsonl
+*.ps1
+*.zip
+*.md
+*.csv
+
+
+
+
+
+
+
 
 # IDE / OS
 

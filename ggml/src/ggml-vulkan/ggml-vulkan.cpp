@@ -750,6 +750,7 @@ struct vk_device_struct {
     vk::DriverId driver_id;
     vk_device_architecture architecture;
     std::unique_ptr<vk_queue> compute_queue;
+    std::unique_ptr<vk_queue> auxiliary_compute_queue;
     std::unique_ptr<vk_queue> transfer_queue;
     bool single_queue;
     bool support_async;
@@ -1068,11 +1069,13 @@ struct vk_device_struct {
         ggml_vk_destroy_buffer(sync_staging);
 
         if (compute_queue) compute_queue->cmd_pool.destroy(device);
+        if (auxiliary_compute_queue) auxiliary_compute_queue->cmd_pool.destroy(device);
         if (transfer_queue) transfer_queue->cmd_pool.destroy(device);
 
         // Explicitly clear to ensure queues drop their shared_ptrs to handles
         // before the Vulkan logical device instance is destroyed
         compute_queue.reset();
+        auxiliary_compute_queue.reset();
         transfer_queue.reset();
 
         for (auto& pipeline : all_pipelines) {
@@ -2195,6 +2198,7 @@ struct ggml_backend_vk_context {
     std::string name;
 
     vk_device device;
+    bool use_auxiliary_compute_queue {};
 
     size_t semaphore_idx, event_idx;
     ggml_vk_garbage_collector gc;
@@ -2270,6 +2274,11 @@ struct ggml_backend_vk_context {
     std::array<uint64_t, VK_PERF_TRACE_STAGE_COUNT> perf_trace_gpu_ns {};
     uint32_t perf_trace_timestamp_overflow {};
 };
+
+static vk_queue * ggml_vk_backend_compute_queue(ggml_backend_vk_context * ctx) {
+    return ctx->use_auxiliary_compute_queue ?
+            ctx->device->auxiliary_compute_queue.get() : ctx->device->compute_queue.get();
+}
 
 static void * const vk_ptr_base = (void *)(uintptr_t) 0x1000;  // NOLINT
 
@@ -3210,6 +3219,10 @@ static void ggml_vk_queue_command_pools_cleanup(vk_device& device) {
 
     if (device->compute_queue->cmd_pool.buffers_in_use() >= cleanup_frequency) {
         ggml_vk_command_pool_cleanup(device, device->compute_queue->cmd_pool);
+    }
+    if (device->auxiliary_compute_queue &&
+            device->auxiliary_compute_queue->cmd_pool.buffers_in_use() >= cleanup_frequency) {
+        ggml_vk_command_pool_cleanup(device, device->auxiliary_compute_queue->cmd_pool);
     }
     if (device->transfer_queue->cmd_pool.buffers_in_use() >= cleanup_frequency) {
         ggml_vk_command_pool_cleanup(device, device->transfer_queue->cmd_pool);
@@ -6243,8 +6256,11 @@ static vk_device ggml_vk_get_device(size_t idx) {
         const uint32_t compute_queue_family_index = ggml_vk_find_queue_family_index(queue_family_props, vk::QueueFlagBits::eCompute, graphics_flag, -1, 1);
         const uint32_t transfer_queue_family_index = ggml_vk_find_queue_family_index(queue_family_props, vk::QueueFlagBits::eTransfer, vk::QueueFlagBits::eCompute | graphics_flag, compute_queue_family_index, 1);
 
-        const float priorities[] = { 1.0f, 1.0f };
+        const float priorities[] = { 1.0f, 1.0f, 1.0f };
         device->single_queue = compute_queue_family_index == transfer_queue_family_index && queue_family_props[compute_queue_family_index].queueCount == 1;
+        const bool has_auxiliary_compute_queue = compute_queue_family_index != transfer_queue_family_index ?
+                queue_family_props[compute_queue_family_index].queueCount >= 2 :
+                queue_family_props[compute_queue_family_index].queueCount >= 3;
 
         std::vector<vk::DeviceQueueCreateInfo> device_queue_create_infos;
         vk::DeviceCreateInfo device_create_info{};
@@ -6426,10 +6442,10 @@ static vk_device ggml_vk_get_device(size_t idx) {
                                                 vk::DeviceQueueCreateFlags();
 
         if (compute_queue_family_index != transfer_queue_family_index) {
-            device_queue_create_infos.push_back({queue_flags, compute_queue_family_index, 1, priorities});
-            device_queue_create_infos.push_back({queue_flags, transfer_queue_family_index, 1, priorities + 1});
+            device_queue_create_infos.push_back({queue_flags, compute_queue_family_index, has_auxiliary_compute_queue ? 2u : 1u, priorities});
+            device_queue_create_infos.push_back({queue_flags, transfer_queue_family_index, 1, priorities});
         } else if(!device->single_queue) {
-            device_queue_create_infos.push_back({queue_flags, compute_queue_family_index, 2, priorities});
+            device_queue_create_infos.push_back({queue_flags, compute_queue_family_index, has_auxiliary_compute_queue ? 3u : 2u, priorities});
         } else {
             device_queue_create_infos.push_back({queue_flags, compute_queue_family_index, 1, priorities});
         }
@@ -6717,6 +6733,9 @@ static vk_device ggml_vk_get_device(size_t idx) {
 
         // Queues
         device->compute_queue = ggml_vk_create_queue(device, compute_queue_family_index, 0, { vk::PipelineStageFlagBits::eComputeShader | vk::PipelineStageFlagBits::eTransfer }, false);
+        if (has_auxiliary_compute_queue) {
+            device->auxiliary_compute_queue = ggml_vk_create_queue(device, compute_queue_family_index, 1, { vk::PipelineStageFlagBits::eComputeShader | vk::PipelineStageFlagBits::eTransfer }, false);
+        }
 
         // Shaders
         // Disable matmul tile sizes early if performance low or not supported
@@ -6817,7 +6836,8 @@ static vk_device ggml_vk_get_device(size_t idx) {
             !allow_graphics_queue;
 
         if (!device->single_queue) {
-            const uint32_t transfer_queue_index = compute_queue_family_index == transfer_queue_family_index ? 1 : 0;
+            const uint32_t transfer_queue_index = compute_queue_family_index == transfer_queue_family_index ?
+                    (has_auxiliary_compute_queue ? 2 : 1) : 0;
             device->transfer_queue = ggml_vk_create_queue(device, transfer_queue_family_index, transfer_queue_index, { vk::PipelineStageFlagBits::eTransfer }, true);
 
             device->async_use_transfer_queue = prefers_transfer_queue || (getenv("GGML_VK_ASYNC_USE_TRANSFER_QUEUE") != nullptr);
@@ -7364,7 +7384,7 @@ static void ggml_vk_instance_init() {
     }
 }
 
-static void ggml_vk_init(ggml_backend_vk_context * ctx, size_t idx) {
+static bool ggml_vk_init(ggml_backend_vk_context * ctx, size_t idx, bool use_auxiliary_compute_queue) {
     VK_LOG_DEBUG("ggml_vk_init(" << ctx->name << ", " << idx << ")");
     ggml_vk_instance_init();
     GGML_ASSERT(idx < vk_instance.device_indices.size());
@@ -7372,6 +7392,10 @@ static void ggml_vk_init(ggml_backend_vk_context * ctx, size_t idx) {
     ctx->name = GGML_VK_NAME + std::to_string(idx);
 
     ctx->device = ggml_vk_get_device(idx);
+    if (use_auxiliary_compute_queue && !ctx->device->auxiliary_compute_queue) {
+        return false;
+    }
+    ctx->use_auxiliary_compute_queue = use_auxiliary_compute_queue;
 
     ctx->semaphore_idx = 0;
     ctx->event_idx = 0;
@@ -7385,7 +7409,7 @@ static void ggml_vk_init(ggml_backend_vk_context * ctx, size_t idx) {
     ctx->fence = ctx->device->device.createFence({});
     ctx->almost_ready_fence = ctx->device->device.createFence({});
 
-    ctx->compute_cmd_pool.init(ctx->device, ctx->device->compute_queue.get());
+    ctx->compute_cmd_pool.init(ctx->device, ggml_vk_backend_compute_queue(ctx));
     if (ctx->device->async_use_transfer_queue) {
         vk::SemaphoreTypeCreateInfo tci{ vk::SemaphoreType::eTimeline, 0 };
         vk::SemaphoreCreateInfo ci{};
@@ -7406,6 +7430,7 @@ static void ggml_vk_init(ggml_backend_vk_context * ctx, size_t idx) {
     const char* output_tensor = getenv("GGML_VULKAN_OUTPUT_TENSOR");
     vk_output_tensor = (output_tensor == NULL ? 0 : atoi(output_tensor));
 #endif
+    return true;
 }
 
 static vk_pipeline ggml_vk_get_to_fp16(ggml_backend_vk_context * ctx, ggml_type type) {
@@ -16122,10 +16147,10 @@ static void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
                 0, nullptr,
             };
             si.setPNext(&tl_info);
-            ctx->device->compute_queue->handle->submit({ si }, ctx->fence);
+            ggml_vk_backend_compute_queue(ctx)->handle->submit({ si }, ctx->fence);
             ctx->transfer_semaphore_last_submitted = ctx->transfer_semaphore.value;
         } else {
-            ctx->device->compute_queue->handle->submit({}, ctx->fence);
+            ggml_vk_backend_compute_queue(ctx)->handle->submit({}, ctx->fence);
         }
         ggml_vk_wait_for_fence(ctx);
         ctx->submit_pending = false;
@@ -16733,8 +16758,9 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         dul.pLabelName = "ggml_backend_vk_graph_compute";
         dul.color = std::array<float,4>{1.0f, 1.0f, 1.0f, 1.0f};
 
-        std::lock_guard<vk_queue_handle> guard(*ctx->device->compute_queue->handle);
-        vk_instance.pfn_vkQueueBeginDebugUtilsLabelEXT(ctx->device->compute_queue->handle->queue, reinterpret_cast<VkDebugUtilsLabelEXT*>(&dul));
+        vk_queue * compute_queue = ggml_vk_backend_compute_queue(ctx);
+        std::lock_guard<vk_queue_handle> guard(*compute_queue->handle);
+        vk_instance.pfn_vkQueueBeginDebugUtilsLabelEXT(compute_queue->handle->queue, reinterpret_cast<VkDebugUtilsLabelEXT*>(&dul));
     }
 
     ctx->prealloc_size_add_rms_partials_offset = 0;
@@ -16758,7 +16784,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
 
     vk_context compute_ctx;
     if (ctx->perf_trace_active) {
-        const uint32_t valid_bits = ggml_vk_timestamp_valid_bits(ctx->device, ctx->device->compute_queue.get());
+        const uint32_t valid_bits = ggml_vk_timestamp_valid_bits(ctx->device, ggml_vk_backend_compute_queue(ctx));
         const uint32_t required_queries = std::max(2, 2*cgraph->n_nodes + 16);
         if (valid_bits == 0) {
             ctx->perf_trace_timestamp_overflow++;
@@ -17157,7 +17183,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 timestamps.size()*sizeof(uint64_t), timestamps.data(), sizeof(uint64_t),
                 vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait),
                 "perf trace graph timestamps");
-        const uint32_t valid_bits = ggml_vk_timestamp_valid_bits(ctx->device, ctx->device->compute_queue.get());
+        const uint32_t valid_bits = ggml_vk_timestamp_valid_bits(ctx->device, ggml_vk_backend_compute_queue(ctx));
         for (const auto & event : ctx->perf_trace_events) {
             const double ns = ggml_vk_timestamp_delta(
                     timestamps[event.begin], timestamps[event.end], valid_bits) *
@@ -17518,7 +17544,10 @@ ggml_backend_t ggml_backend_vk_init(size_t dev_num) {
     VK_LOG_DEBUG("ggml_backend_vk_init(" << dev_num << ")");
 
     ggml_backend_vk_context * ctx = new ggml_backend_vk_context;
-    ggml_vk_init(ctx, dev_num);
+    if (!ggml_vk_init(ctx, dev_num, false)) {
+        delete ctx;
+        return nullptr;
+    }
 
     ggml_backend_t vk_backend = new ggml_backend {
         /* .guid    = */ ggml_backend_vk_guid(),
@@ -17689,9 +17718,27 @@ static void ggml_backend_vk_device_get_props(ggml_backend_dev_t dev, struct ggml
 }
 
 static ggml_backend_t ggml_backend_vk_device_init(ggml_backend_dev_t dev, const char * params) {
-    UNUSED(params);
     ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *)dev->context;
-    return ggml_backend_vk_init(ctx->device);
+    const bool use_auxiliary_compute_queue = params && strcmp(params, "queue=auxiliary") == 0;
+    if (!use_auxiliary_compute_queue) {
+        return ggml_backend_vk_init(ctx->device);
+    }
+
+    ggml_backend_vk_context * backend_ctx = new ggml_backend_vk_context;
+    if (!ggml_vk_init(backend_ctx, ctx->device, true)) {
+        delete backend_ctx;
+        return nullptr;
+    }
+    ggml_backend_t backend = new ggml_backend {
+        /* .guid    = */ ggml_backend_vk_guid(),
+        /* .iface   = */ ggml_backend_vk_interface,
+        /* .device  = */ dev,
+        /* .context = */ backend_ctx,
+    };
+    if (!backend_ctx->device->support_async) {
+        backend->iface.get_tensor_async = nullptr;
+    }
+    return backend;
 }
 
 static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {

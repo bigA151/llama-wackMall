@@ -139,17 +139,23 @@ Frees \~5.4 GiB VmRSS on 35B models.
 
 ## 7\. Pre-gated predictive prefetch (LLAMA\_EXPERT\_PREDICT, LLAMA\_EXPERT\_PREFETCH\_GB)
 
-Pre-gate predictor: runs layer L+1's exact router on layer L's hidden state
-(one step ahead of demand). No learned parameters — the model's own gating
-function applied early. Norm reconstruction is exact: norm\_{L+1} \* (x / norm\_L),
-eps-guarded for zeroed REAP weights.
+Pre-gate predictor: runs physical layer L+4's exact router on layer L's hidden
+state (four layers ahead of demand). No learned parameters — the model's own
+gating function applied early. Norm reconstruction uses
+norm\_{L+4} \* (x / norm\_L), eps-guarded for zeroed REAP weights. If physical
+layer L+4 has no compatible mirrored router, prediction for L is skipped.
 
-* Oracle: top-1 \~99%, top-8 covers 81.5% of actual selections (122B).
+* Accuracy depends on the model and lookahead distance; measure it with
+  LLAMA\_EXPERT\_STATS (`expert_predict_accuracy`).
 * \~100 MiB CPU mirror of router gate + norm weights per model.
-* Predictions push (layer+1, expert) pairs into a work queue.
+* FFN gate/up start submits one prediction ticket to a dedicated single-thread
+  prediction queue. Prediction compute overlaps FFN; completed tickets classify
+  selected experts before any physical I/O is queued.
+* Residency classification order is HOT (generation-pinned), demand pool,
+  speculative READY/FILLING (refresh/merge), then a new prefetch request.
 
 Speculative pool (LLAMA\_EXPERT\_PREFETCH\_GB): separate from the demand pool.
-Worker threads drain the prediction queue mid-step: claim FREE spec slots
+Worker threads drain the weight queue mid-step: claim FREE spec slots
 via CAS (FREE->FILLING), memcpy from mmap, release-store READY. Cold ops
 probe READY slots via moe\_cold\_addr — hit costs one atomic load, miss falls
 back to ptrs/mmap transparently. byte-identical correctness.
@@ -158,6 +164,16 @@ back to ptrs/mmap transparently. byte-identical correctness.
 * Workers own state 1; the update() window owns 0/2/3.
 * Window publishes READY->RESIDENT and evicts oldest-timestamped to
 keep \~25% slots free.
+* New speculative work does not start while a demand read is active. A
+  speculative read already in flight may overlap demand from another layer;
+  an incorrect same-layer prediction is canceled at the next copy-chunk
+  boundary. A correct in-flight prediction is promoted and demand waits for
+  the original worker, so a second fill never races the slot.
+* Copy order is gate/up followed by down, with a configurable cancellation
+  chunk (default 4 MiB). Expired L+4 tickets are canceled at the update window.
+* Hot prediction pins carry expert, slot, and generation. Wrong pins release
+  when the actual route is known; correct pins release after FFN/update, and a
+  generation mismatch cannot unlock a recycled slot.
 * Env: LLAMA\_EXPERT\_PREFETCH\_THREADS (default 2), LLAMA\_EXPERT\_PREFETCH\_MB
 (default 64 MiB in-flight cap).
 
@@ -204,4 +220,3 @@ RTX 3070 8 GB VRAM, 31 GB RAM, SSD model. PPL = 1.6088 (all configs).
 |Qwen3.5-122B-A10B|IQ2\_M (28 GB)|\~8.0 tok/s|10.60 tok/s (S=28)|+33%|
 
 Apache 2.0 License. See LICENSE.
-

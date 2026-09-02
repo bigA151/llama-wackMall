@@ -1428,7 +1428,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     // compute is async: update() may overwrite tiering buffers the graph is still reading
     ggml_backend_sched_synchronize(sched.get());
-    llama_expert_tier::update();
+    llama_expert_tier::update(ubatch.n_tokens);
     end_perf_trace();
 
     ret = GGML_STATUS_SUCCESS;
@@ -3651,6 +3651,7 @@ llama_context * llama_new_context_with_model(
 }
 
 void llama_free(llama_context * ctx) {
+    llama_expert_tier::shutdown();
     delete ctx;
 }
 

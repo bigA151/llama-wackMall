@@ -28,6 +28,10 @@ LLAMA_API void configure_prefetch(int slots_per_layer, int max_experts, int chun
 // call once after the model tensors are loaded; no-op unless LLAMA_EXPERT_HOT is set
 void init(const llama_model & model);
 
+// Stop predictor/prefetch workers and release their private backend resources
+// before the owning llama context destroys its backend scheduler.
+void shutdown();
+
 // drop-in replacement for ggml_mul_mat_id on MoE expert weights:
 // hot part on the GPU via the pinned store, cold part on the CPU via
 // ggml_mul_mat_id_cold; falls back to plain ggml_mul_mat_id when the weight
@@ -36,7 +40,7 @@ ggml_tensor * build_mul_mat_id(ggml_context * ctx, ggml_tensor * w, ggml_tensor 
 
 // consume accumulated expert selection counts, update scores and
 // (LLAMA_EXPERT_ADAPT) repin hot slots; call after each ubatch compute
-void update();
+void update(int64_t n_tokens);
 
 // detailed per-ubatch timing trace
 void set_perf_trace(bool enabled);

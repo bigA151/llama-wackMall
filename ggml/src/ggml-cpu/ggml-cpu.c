@@ -2153,6 +2153,17 @@ void ggml_moe_cold_timers_us(uint64_t * total, uint64_t * setup,
     }
 }
 
+void ggml_moe_matvec_f32(const float * matrix, const float * x, float * dst,
+                         int64_t rows, int64_t cols) {
+    if (!matrix || !x || !dst || rows <= 0 || cols <= 0 || cols > INT_MAX) {
+        return;
+    }
+    for (int64_t row = 0; row < rows; ++row) {
+        ggml_vec_dot_f32((int) cols, dst + row, 0,
+                matrix + (size_t) row*(size_t) cols, 0, x, 0, 1);
+    }
+}
+
 // expert tiering: optional pre-gate prediction hook, set by the tier module
 static void (*g_moe_predict_hook)(const struct ggml_tensor *, const struct ggml_tensor *) = NULL;
 
